@@ -1,6 +1,6 @@
 # Signal Connector V3 Contract
 
-> **Status**: runtime contract documented; simulation and daemon-policy drift documented
+> **Status**: native acknowledged SSE delivery implemented; simulation and daemon-policy drift documented
 > **Bead**: `flywheel_connectors-4kw5f.12`
 > **Parent**: `flywheel_connectors-4kw5f`
 > **Verification script**: none tracked; use the commands below
@@ -31,6 +31,7 @@ The current crate also exposes these event topics:
 - `signal.receipt.read`
 - `signal.typing.received`
 - `signal.policy.denied`
+- `signal.events` (all normalized event types on one native stream)
 
 Important runtime truths the contract preserves:
 
@@ -50,7 +51,8 @@ Important runtime truths the contract preserves:
 - `trust_identity` uses `PUT /v1/identities/{number}/trust/{target}` with either `verified_safety_number` or `trust_all_known_keys`.
 - Handshake installs a `CapabilityVerifier` and returns a real manifest hash.
 - `invoke` verifies a bound capability token for the requested operation before calling the daemon.
-- `subscribe` requires a bound `signal.read` token for `signal.receive_messages`, confirms requested event topics, and starts a supervised SSE reader for `/api/v1/events?account=...`.
+- Native `subscribe` requires negotiated read authority and a bound `signal.read` token for the dedicated `signal.subscribe` control operation over `signal:events:<topic>`. That grant does not authorize the separate queue-reading `signal.receive_messages` invocation. Subscription starts a supervised SSE reader for `/api/v1/events?account=...` and emits acknowledged JSONL notifications through the host transport.
+- The native executable uses one persistent runtime, a bounded request reader, and a serialized stdout writer. ACK controls can arrive while ordinary RPC handlers are running; shutdown exits without waiting for stdin EOF.
 - `self_check` performs a live daemon health probe against `/v1/about`.
 - `health` is primarily local state plus bridge diagnostics; configured state can report ready before `self_check` proves daemon reachability.
 - `simulate` currently returns allowed for any request and does not validate configuration, input, capability token, daemon reachability, or operation-specific policy.
@@ -61,15 +63,15 @@ This README documents the runtime truth and keeps current drift visible:
 
 - Manifest network constraints allow only loopback daemon hosts on port `8080`, but runtime configuration accepts any `http` or `https` daemon host.
 - Manifest forbids `network.listen`, `system.exec`, and `system.privileged`; the current connector talks to an already-running daemon and does not spawn or supervise it.
-- Handshake grants every requested capability rather than filtering to the manifest capability set.
+- Handshake grants only the connector's declared read, send, and admin capabilities, honors the host-requested instance ID, and requires reconfiguration before replacing an existing session.
 - `simulate` is permissive and not policy-aware.
 - `health` can report ready based on configuration even when the daemon has not been probed yet.
-- `shutdown` stops streaming, clears subscribed topics, resets bridge state, and shuts down the runtime, but it does not clear configuration, client, verifier, or configured/handshaken base flags.
+- `shutdown` fences streaming, closes pending delivery, clears configuration, client, verifier, and lifecycle flags, and resets bridge progress. Reconfiguration also revokes the preceding session.
 - `trust_identity` requires interactive approval in the operation metadata, but connector-local invoke only enforces the bound `signal.admin` capability token.
 - Runtime URL validation reports whether the daemon host is loopback in doctor output but does not fail non-loopback daemon URLs.
 - There is no dedicated tracked verification shell script for this connector.
 
-A follow-up parity bead should enforce loopback or explicit host policy at runtime, filter handshake grants, make simulation capability-aware, align shutdown state with lifecycle expectations, and decide whether connector-local approval enforcement belongs in this runtime path.
+A follow-up parity bead should enforce loopback or explicit host policy at runtime, make simulation capability-aware, and decide whether connector-local approval enforcement belongs in this runtime path.
 
 ## First-Slice Scope
 
@@ -78,7 +80,7 @@ The current Signal README slice documents the implemented runtime surface:
 - local `signal-cli-rest-api` daemon configuration
 - message send, receive polling, group list/detail, identity lookup, and identity trust operations
 - bound capability-token verification in invoke and subscribe
-- SSE event subscription, topic filtering, in-memory cursors, and no-replay event caps
+- SSE event subscription, topic filtering, acknowledged native transport, in-memory cursors, and no-replay event caps
 - inbound direct-message and group authorization policy
 - bridge health checks, reconnect backoff, group cache, receive cursor, and attachment-size validation
 - provider error mapping for 401, 404, 429, retryable 5xx, daemon unreachability, timeout, JSON, and attachment errors
@@ -143,11 +145,24 @@ The current Signal README slice documents the implemented runtime surface:
 
 | Topic | Source | Ack | Replay | Rationale |
 |-------|--------|-----|--------|-----------|
-| `signal.message.received` | SSE accepted message or attachment event | no | no | Emits authorized direct or group message content. |
-| `signal.reaction.received` | SSE accepted reaction-only event | no | no | Emits authorized reaction payloads. |
-| `signal.receipt.read` | SSE receipt event | no | no | Emits read or delivery receipt payloads when configured. |
-| `signal.typing.received` | SSE typing event | no | no | Emits typing indicators when configured. |
-| `signal.policy.denied` | Connector policy decision | no | no | Emits structured denial metadata without message body content. |
+| `signal.message.received` | SSE accepted message or attachment event | yes | no | Emits authorized direct or group message content. |
+| `signal.reaction.received` | SSE accepted reaction-only event | yes | no | Emits authorized reaction payloads. |
+| `signal.receipt.read` | SSE receipt event | yes | no | Emits read or delivery receipt payloads when configured. |
+| `signal.typing.received` | SSE typing event | yes | no | Emits typing indicators when configured. |
+| `signal.policy.denied` | Connector policy decision | yes | no | Emits structured denial metadata without message body content. |
+| `signal.events` | All five normalized event types | yes | no | Wraps each event as `{"source_topic": "signal.…", "event": {...}}`. |
+
+## Native Delivery And Receive Progress
+
+The native `subscribe` RPC requires one exact topic, a host-issued `stream_id`, a signed instance-bound capability token, and an optional `window_size` from 1 through 64. Use `signal.events` to consume all event types on the single stream. Replay (`since`), batching, and rate options are rejected. Changing the stream ID or topic requires reconfiguration; a repeated subscription for the same active stream renews its token without replacing the pending event.
+
+Each manifest event declares the read capability, subscription operation, and exact resource URI required by the host. The connector rechecks signature, instance, zone, operation, resource restrictions, and token expiry before connecting or delivering, while waiting for acknowledgement, and before committing progress. Events carry the negotiated zone and require acknowledgement.
+
+The producer uses one event credit and waits up to 30 seconds for the host's exact stream/topic/sequence/cursor ACK. Flushing stdout does not advance receive progress. Wrong acknowledgements, closed streams, token expiry, transport failures, and cancelled generations leave the event's cursor uncommitted. Successful acknowledgements advance the in-memory receive cursor and SSE `Last-Event-ID` hint; unsubscribe/resubscribe retains the hint, while reconfiguration, shutdown, and process restart reset it. Polling receive timestamps are never used as SSE event IDs. Explicitly unselected topics may be skipped, so select the aggregate topic when every event type matters.
+
+The daemon decides whether `Last-Event-ID` is useful; the connector does not promise provider replay or durable cross-process recovery. Host acknowledgement does not make downstream effects exactly once. Event notifications are bounded by the SDK's 256 KiB frame limit. Embedded library callers without an attached native transport retain best-effort broadcast delivery: a successful enqueue advances their in-memory cursor, while a missing receiver fails delivery and preserves progress. The native process rejects that embedded subscription entry point.
+
+Native wire cursors are bounded account-scoped digests, separate from the daemon resume hint. A real SSE ID retains its identity even if the daemon incorrectly changes its content; without an ID, the digest includes the original topic, principal, and normalized payload so distinct events sharing a timestamp do not collide. Identical content without a unique provider ID cannot distinguish a duplicate from another identical event; no durable replay guarantee is claimed. Closing and reopening the same stream immediately fences the old producer, including when it is idle.
 
 ## Explicit Non-Goals
 
@@ -158,7 +173,7 @@ The current implementation does not include:
 - direct Signal service calls without the local REST daemon
 - contact search, contact sync, profile update, group creation, group mutation, pinning, reactions send/delete, receipts send, or typing send operations
 - attachment download, attachment serving, durable attachment storage, or attachment cleanup
-- durable replay buffers, exactly-once delivery, event acknowledgements, or persistent SSE resume state
+- durable replay buffers, exactly-once delivery, or persistent SSE resume state
 - generic Signal bot workflow orchestration or pairing approval workflows
 
 These are excluded on purpose:
@@ -243,7 +258,7 @@ The verification surface captures:
 - If `configure` fails, provide a valid E.164 `phone_number`, a valid `http` or `https` `daemon_url`, positive timeout values, and nonblank optional paths.
 - If `self_check` fails with bridge not running, start or repair the local daemon outside this connector.
 - If `invoke` reports a missing capability, mint a bound token for the required Signal capability and exact operation ID.
-- If `subscribe` is rejected, provide a bound `signal.read` token for `signal.receive_messages` and request one or more supported event topics.
+- If native `subscribe` is rejected, negotiate `signal.read` during handshake, provide a bound token for `signal.subscribe` and `signal:events:<topic>`, and select one exact topic (use `signal.events` for all types).
 - If group events disappear, inspect `inbound_policy.group_policy`, `group_allow_from`, and mention settings.
 - If messages are unexpectedly consumed, remember that the daemon receive endpoint drains pending messages.
 

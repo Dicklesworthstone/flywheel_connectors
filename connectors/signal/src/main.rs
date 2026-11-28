@@ -2,7 +2,7 @@
 
 #![forbid(unsafe_code)]
 
-use std::io::{BufRead, Write};
+use std::io::BufReader;
 
 use anyhow::Result;
 use fcp_prelude::{FcpError, FcpResult, SimulateRequest};
@@ -23,33 +23,27 @@ fn main() -> Result<()> {
 }
 
 fn run_fcp_loop() -> Result<()> {
-    let stdin = std::io::stdin();
-    let mut stdout = std::io::stdout();
+    let events = JsonlEventStream::new(JsonlWriter::new(std::io::stdout()));
     let mut connector = SignalConnector::new();
-
-    for line in stdin.lock().lines() {
-        let line = line?;
-        if line.is_empty() {
-            continue;
-        }
-
-        let response =
-            fcp_async_core::runtime::block_on_sync(handle_message(&mut connector, &line))
-                .unwrap_or_else(|e| {
-                    serde_json::json!({
-                        "jsonrpc": "2.0",
-                        "error": {
-                            "code": "FCP-9001",
-                            "message": format!("Runtime error: {e}")
-                        }
-                    })
-                });
-
-        let response_json = serde_json::to_string(&response)?;
-        writeln!(stdout, "{response_json}")?;
-        stdout.flush()?;
-    }
-
+    connector.attach_event_stream(events.clone())?;
+    let runtime = fcp_async_core::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    let result = serve_jsonl_events(
+        BufReader::new(std::io::stdin()),
+        events,
+        JsonlConfig::default(),
+        |method, params| runtime.block_on(dispatch_message(&mut connector, method, params)),
+    );
+    // EOF and malformed/failed transport retire every outstanding ACK and
+    // fence the SSE worker just like an explicit shutdown request.
+    let _ = runtime.block_on(connector.shutdown(ShutdownRequest {
+        r#type: "shutdown".into(),
+        deadline_ms: 1_000,
+        drain: false,
+        reason: Some("native transport closed".into()),
+    }));
+    result?;
     Ok(())
 }
 
@@ -60,122 +54,66 @@ fn encode<T: serde::Serialize>(value: &T) -> FcpResult<serde_json::Value> {
 }
 
 #[allow(clippy::too_many_lines)]
-async fn handle_message(connector: &mut SignalConnector, message: &str) -> serde_json::Value {
-    let request: serde_json::Value = match serde_json::from_str(message) {
-        Ok(v) => v,
-        Err(e) => {
-            return serde_json::json!({
-                "jsonrpc": "2.0",
-                "error": {
-                    "code": "FCP-1001",
-                    "message": format!("Invalid JSON: {e}")
-                }
-            });
+async fn dispatch_message(
+    connector: &mut SignalConnector,
+    method: &str,
+    params: serde_json::Value,
+) -> FcpResult<serde_json::Value> {
+    match method {
+        "configure" => {
+            connector.configure(params).await?;
+            Ok(serde_json::json!({ "status": "configured" }))
         }
-    };
-
-    let method = request.get("method").and_then(|v| v.as_str()).unwrap_or("");
-    let id = request.get("id").cloned();
-    let params = request
-        .get("params")
-        .cloned()
-        .unwrap_or_else(|| serde_json::json!({}));
-
-    let result: FcpResult<serde_json::Value> = async {
-        match method {
-            "configure" => {
-                connector.configure(params).await?;
-                Ok(serde_json::json!({ "status": "configured" }))
-            }
-            "handshake" => {
-                let req: HandshakeRequest =
-                    serde_json::from_value(params).map_err(|e| FcpError::InvalidRequest {
-                        code: 1003,
-                        message: format!("Invalid handshake request: {e}"),
-                    })?;
-                encode(&connector.handshake(req).await?)
-            }
-            "health" => encode(&connector.health().await),
-            "doctor" => encode(&connector.doctor()),
-            "self_check" => encode(&connector.self_check().await?),
-            "introspect" => encode(&connector.introspect()),
-            "invoke" => {
-                let req: InvokeRequest =
-                    serde_json::from_value(params).map_err(|e| FcpError::InvalidRequest {
-                        code: 1003,
-                        message: format!("Invalid invoke request: {e}"),
-                    })?;
-                encode(&connector.invoke(req).await?)
-            }
-            "simulate" => {
-                let req: SimulateRequest =
-                    serde_json::from_value(params).map_err(|e| FcpError::InvalidRequest {
-                        code: 1003,
-                        message: format!("Invalid simulate request: {e}"),
-                    })?;
-                encode(&connector.simulate(req).await?)
-            }
-            "subscribe" => {
-                let req: SubscribeRequest =
-                    serde_json::from_value(params).map_err(|e| FcpError::InvalidRequest {
-                        code: 1003,
-                        message: format!("Invalid subscribe request: {e}"),
-                    })?;
-                encode(&connector.subscribe(req).await?)
-            }
-            "unsubscribe" => {
-                let req: UnsubscribeRequest =
-                    serde_json::from_value(params).map_err(|e| FcpError::InvalidRequest {
-                        code: 1003,
-                        message: format!("Invalid unsubscribe request: {e}"),
-                    })?;
-                connector.unsubscribe(req).await?;
-                Ok(serde_json::json!({ "status": "unsubscribed" }))
-            }
-            "shutdown" => {
-                let req: ShutdownRequest =
-                    serde_json::from_value(params).map_err(|e| FcpError::InvalidRequest {
-                        code: 1003,
-                        message: format!("Invalid shutdown request: {e}"),
-                    })?;
-                connector.shutdown(req).await?;
-                Ok(serde_json::json!({ "status": "shutdown_accepted" }))
-            }
-            _ => Err(FcpError::InvalidRequest {
-                code: 1002,
-                message: format!("Unknown method: {method}"),
-            }),
+        "handshake" => {
+            let req: HandshakeRequest =
+                serde_json::from_value(params).map_err(|e| FcpError::InvalidRequest {
+                    code: 1003,
+                    message: format!("Invalid handshake request: {e}"),
+                })?;
+            encode(&connector.handshake(req).await?)
         }
-    }
-    .await;
-
-    match result {
-        Ok(value) => {
-            let mut response = serde_json::json!({
-                "jsonrpc": "2.0",
-                "result": value
-            });
-            if let Some(id) = id {
-                response
-                    .as_object_mut()
-                    .unwrap()
-                    .insert("id".to_string(), id);
-            }
-            response
+        "health" => encode(&connector.health().await),
+        "doctor" => encode(&connector.doctor()),
+        "self_check" => encode(&connector.self_check().await?),
+        "introspect" => encode(&connector.introspect()),
+        "invoke" => {
+            let request: InvokeRequest =
+                serde_json::from_value(params).map_err(|_| FcpError::InvalidRequest {
+                    code: 1003,
+                    message: "Invalid Signal invoke request".into(),
+                })?;
+            encode(&connector.invoke(request).await?)
         }
-        Err(e) => {
-            let err_response = e.to_response();
-            let mut response = serde_json::json!({
-                "jsonrpc": "2.0",
-                "error": err_response
-            });
-            if let Some(id) = id {
-                response
-                    .as_object_mut()
-                    .unwrap()
-                    .insert("id".to_string(), id);
-            }
-            response
+        "simulate" => {
+            let req: SimulateRequest =
+                serde_json::from_value(params).map_err(|e| FcpError::InvalidRequest {
+                    code: 1003,
+                    message: format!("Invalid simulate request: {e}"),
+                })?;
+            encode(&connector.simulate(req).await?)
         }
+        "subscribe" => connector.handle_native_subscribe(params).await,
+        "unsubscribe" => {
+            let req: UnsubscribeRequest =
+                serde_json::from_value(params).map_err(|e| FcpError::InvalidRequest {
+                    code: 1003,
+                    message: format!("Invalid unsubscribe request: {e}"),
+                })?;
+            connector.unsubscribe(req).await?;
+            Ok(serde_json::json!({ "status": "unsubscribed" }))
+        }
+        "shutdown" => {
+            let req: ShutdownRequest =
+                serde_json::from_value(params).map_err(|e| FcpError::InvalidRequest {
+                    code: 1003,
+                    message: format!("Invalid shutdown request: {e}"),
+                })?;
+            connector.shutdown(req).await?;
+            Ok(serde_json::json!({ "status": "shutdown_accepted" }))
+        }
+        _ => Err(FcpError::InvalidRequest {
+            code: 1002,
+            message: format!("Unknown method: {method}"),
+        }),
     }
 }

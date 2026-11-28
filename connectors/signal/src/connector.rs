@@ -52,6 +52,7 @@ const OP_LIST_GROUPS: &str = "signal.list_groups";
 const OP_GET_GROUP: &str = "signal.get_group";
 const OP_GET_IDENTITY: &str = "signal.get_identity";
 const OP_TRUST_IDENTITY: &str = "signal.trust_identity";
+const NATIVE_SUBSCRIBE_OPERATION: &str = "signal.subscribe";
 const OPERATION_ORDER: [&str; 6] = [
     OP_SEND_MESSAGE,
     OP_RECEIVE_MESSAGES,
@@ -67,8 +68,10 @@ const EVENT_REACTION_RECEIVED: &str = "signal.reaction.received";
 const EVENT_RECEIPT_READ: &str = "signal.receipt.read";
 const EVENT_TYPING_RECEIVED: &str = "signal.typing.received";
 const EVENT_POLICY_DENIED: &str = "signal.policy.denied";
+const EVENT_ALL: &str = "signal.events";
 const SIGNAL_SSE_EVENT_BUFFER_CAPACITY: usize = 256;
 const SIGNAL_SSE_MAX_BUFFER_BYTES: usize = 1024 * 1024;
+const SIGNAL_NATIVE_ACK_TIMEOUT: Duration = Duration::from_secs(30);
 
 // Capability IDs
 const CAP_SEND: &str = "signal.send";
@@ -225,33 +228,127 @@ fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 #[derive(Debug)]
 struct SignalStreamRuntime {
-    task: Mutex<Option<fcp_async_core::task::JoinHandle<()>>>,
-    shutdown_tx: Mutex<Option<watch::Sender<bool>>>,
+    control: Mutex<SignalStreamControl>,
+}
+
+#[derive(Debug)]
+struct SignalStreamControl {
+    task: Option<fcp_async_core::task::JoinHandle<()>>,
+    shutdown_tx: Option<watch::Sender<bool>>,
+    epoch: Arc<()>,
+    // SSE event IDs and receive-poll timestamps are different namespaces.
+    // Only successfully handed-off SSE frames may supply Last-Event-ID.
+    resume_event_id: Option<String>,
 }
 
 impl SignalStreamRuntime {
-    const fn new() -> Self {
+    fn new() -> Self {
         Self {
-            task: Mutex::new(None),
-            shutdown_tx: Mutex::new(None),
+            control: Mutex::new(SignalStreamControl {
+                task: None,
+                shutdown_tx: None,
+                epoch: Arc::new(()),
+                resume_event_id: None,
+            }),
         }
     }
 
     fn is_running(&self) -> bool {
-        lock_unpoisoned(&self.task)
+        lock_unpoisoned(&self.control)
+            .task
             .as_ref()
             .is_some_and(|task| !task.is_finished())
     }
 
     fn stop(&self) {
-        let shutdown_tx = lock_unpoisoned(&self.shutdown_tx).take();
+        let (shutdown_tx, task) = {
+            let mut control = lock_unpoisoned(&self.control);
+            control.epoch = Arc::new(());
+            (control.shutdown_tx.take(), control.task.take())
+        };
         if let Some(shutdown_tx) = shutdown_tx {
             let _ = shutdown_tx.send(true);
         }
-        let task = lock_unpoisoned(&self.task).take();
         if let Some(task) = task {
             task.abort();
         }
+    }
+}
+
+struct SignalNativeSubscription {
+    stream: JsonlEventStream,
+    stream_id: String,
+    topic: String,
+    token: Mutex<CapabilityToken>,
+    verifier: CapabilityVerifier,
+}
+
+impl SignalNativeSubscription {
+    fn verify_authority(&self) -> FcpResult<()> {
+        let token = lock_unpoisoned(&self.token).clone();
+        let verified = self.verifier.verify_bound(
+            token,
+            &CapabilityId::from_static(CAP_READ),
+            &OperationId::from_static(NATIVE_SUBSCRIBE_OPERATION),
+            &[format!("signal:events:{}", self.topic)],
+        )?;
+        let expiration =
+            verified
+                .claims()
+                .get_expiration()
+                .ok_or_else(|| FcpError::MissingField {
+                    field: "capability_token.exp".into(),
+                })?;
+        if chrono::Utc::now().timestamp() >= expiration {
+            return Err(FcpError::TokenExpired);
+        }
+        Ok(())
+    }
+
+    fn require_active(&self) -> FcpResult<()> {
+        self.verify_authority()?;
+        if !self.stream.accepts(&self.topic) {
+            return Err(signal_stream_unavailable(
+                "Signal native event stream is closed",
+            ));
+        }
+        Ok(())
+    }
+
+    fn prepare(&self, mut event: EventEnvelope) -> FcpResult<Option<JsonlEventDelivery>> {
+        self.require_active()?;
+        if self.topic == EVENT_ALL {
+            event.data.payload = json!({"source_topic": event.topic, "event": event.data.payload});
+            event.topic.clone_from(&self.topic);
+        } else if event.topic != self.topic {
+            return Ok(None);
+        }
+        event.data.zone_id = self.verifier.zone_id.clone();
+        event.requires_ack = true;
+        self.stream.deliver(&event).map(Some)
+    }
+
+    async fn await_ack(&self, mut delivery: JsonlEventDelivery) -> FcpResult<()> {
+        fcp_async_core::time::timeout(SIGNAL_NATIVE_ACK_TIMEOUT, async {
+            loop {
+                fcp_async_core::select! {
+                    result = &mut delivery => return result,
+                    () = fcp_async_core::time::sleep(Duration::from_secs(1)) => self.require_active()?,
+                }
+            }
+        })
+        .await
+        .map_err(|_| signal_stream_unavailable(
+            "Signal downstream acknowledgement timed out; receive progress was not advanced",
+        ))??;
+        self.require_active()
+    }
+}
+
+fn signal_stream_unavailable(message: &str) -> FcpError {
+    FcpError::ConnectorUnavailable {
+        code: 5001,
+        message: message.into(),
     }
 }
 
@@ -266,6 +363,129 @@ struct SignalStreamFrame {
     event_id: Option<String>,
     cursor: Option<String>,
     outcome: SignalStreamOutcome,
+}
+
+struct SignalDeliveryContext {
+    account: String,
+    bridge: Arc<BridgeManager>,
+    event_tx: broadcast::Sender<FcpResult<EventEnvelope>>,
+    topics: Arc<Mutex<Vec<String>>>,
+    next_event_seq: Arc<AtomicU64>,
+    connector_id: ConnectorId,
+    instance_id: InstanceId,
+    base: Arc<BaseConnector>,
+    stream: Arc<SignalStreamRuntime>,
+    epoch: Arc<()>,
+    native: Option<Arc<SignalNativeSubscription>>,
+    zone: ZoneId,
+}
+
+impl SignalDeliveryContext {
+    async fn deliver(&self, frame: SignalStreamFrame) -> FcpResult<()> {
+        let cursor = frame.cursor.clone();
+        let event_id = frame.event_id.clone();
+        let mut event =
+            signal_stream_frame_to_envelope(frame, &self.connector_id, &self.instance_id).map_err(
+                |_| FcpError::Internal {
+                    message: "Failed to encode Signal event".into(),
+                },
+            )?;
+        if self.native.is_some() {
+            event.cursor = signal_native_event_cursor(&self.account, event_id.as_deref(), &event)?;
+        }
+        let seq = self
+            .next_event_seq
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |seq| {
+                seq.checked_add(1)
+            })
+            .map_err(|_| signal_stream_unavailable("Signal event sequence exhausted"))?;
+        event = event.with_seq(seq);
+        event.data.zone_id = self.zone.clone();
+        if event.cursor.is_empty() {
+            event = event.with_cursor_seq(seq);
+        }
+
+        let (delivery, emitted) = {
+            // Serialize emission admission with stop/reconfigure. No lock is
+            // held while waiting for the downstream acknowledgement.
+            let control = lock_unpoisoned(&self.stream.control);
+            self.require_epoch(&control)?;
+            if let Some(native) = &self.native {
+                let delivery = native.prepare(event)?;
+                let emitted = delivery.is_some();
+                (delivery, emitted)
+            } else {
+                let allowed = lock_unpoisoned(&self.topics).contains(&event.topic);
+                if allowed {
+                    self.event_tx.send(Ok(event)).map_err(|_| signal_stream_unavailable(
+                        "Signal embedded event receiver is unavailable; receive progress was not advanced",
+                    ))?;
+                }
+                (None, allowed)
+            }
+        };
+        if let Some(delivery) = delivery {
+            self.native
+                .as_ref()
+                .expect("native delivery")
+                .await_ack(delivery)
+                .await?;
+        }
+
+        let mut control = lock_unpoisoned(&self.stream.control);
+        self.require_epoch(&control)?;
+        if let Some(native) = &self.native {
+            native.require_active()?;
+        }
+        if let Some(cursor) = cursor {
+            self.bridge.advance_cursor(cursor);
+        }
+        if let Some(event_id) = event_id {
+            control.resume_event_id = (!event_id.is_empty()).then_some(event_id);
+        }
+        if emitted {
+            self.base.record_event();
+        }
+        Ok(())
+    }
+
+    fn require_epoch(&self, control: &SignalStreamControl) -> FcpResult<()> {
+        if !Arc::ptr_eq(&control.epoch, &self.epoch) {
+            return Err(signal_stream_unavailable(
+                "Signal stream generation was retired",
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn signal_native_event_cursor(
+    account: &str,
+    event_id: Option<&str>,
+    event: &EventEnvelope,
+) -> FcpResult<String> {
+    // Reusing a genuine provider ID with changed content must remain visible
+    // to the host journal. Without an ID, a timestamp alone is not unique
+    // across senders or event types; use the normalized content identity.
+    let identity = if let Some(id) = event_id.filter(|id| !id.is_empty()) {
+        json!(["fcp.signal.native-event.v1", account, "sse-id", id])
+    } else {
+        json!([
+            "fcp.signal.native-event.v1",
+            account,
+            "content",
+            event.topic,
+            event.data.principal,
+            event.data.payload,
+        ])
+    };
+    let encoded = serde_json::to_vec(&identity).map_err(|_| FcpError::Internal {
+        message: "Could not encode Signal event identity".into(),
+    })?;
+    Ok(format!(
+        "signal:v1:{}",
+        hex::encode(Sha256::digest(encoded))
+    ))
 }
 
 // Doctor types
@@ -299,7 +519,11 @@ pub struct SignalConnector {
     retry_config: HttpRetryConfig,
     started_at: Instant,
     verifier: Option<CapabilityVerifier>,
+    granted_capabilities: Vec<CapabilityId>,
     bridge: Option<Arc<BridgeManager>>,
+    event_stream: Option<JsonlEventStream>,
+    event_subscription: Option<Arc<SignalNativeSubscription>>,
+    native_stream_identity: Option<(String, String)>,
     event_tx: broadcast::Sender<FcpResult<EventEnvelope>>,
     next_event_seq: Arc<AtomicU64>,
     subscribed_topics: Arc<Mutex<Vec<String>>>,
@@ -318,7 +542,10 @@ impl std::fmt::Debug for SignalConnector {
             .field("retry_config", &self.retry_config)
             .field("started_at", &self.started_at)
             .field("verifier", &self.verifier)
+            .field("granted_capabilities", &self.granted_capabilities)
             .field("bridge", &self.bridge)
+            .field("event_stream_attached", &self.event_stream.is_some())
+            .field("native_subscription", &self.event_subscription.is_some())
             .field("event_tx", &"<broadcast-sender>")
             .field("next_event_seq", &self.next_event_seq)
             .field("subscribed_topics", &self.subscribed_topics)
@@ -342,7 +569,11 @@ impl SignalConnector {
             retry_config: HttpRetryConfig::default(),
             started_at: Instant::now(),
             verifier: None,
+            granted_capabilities: Vec::new(),
             bridge: None,
+            event_stream: None,
+            event_subscription: None,
+            native_stream_identity: None,
             event_tx,
             next_event_seq: Arc::new(AtomicU64::new(1)),
             subscribed_topics: Arc::new(Mutex::new(Vec::new())),
@@ -379,6 +610,139 @@ impl SignalConnector {
     #[must_use]
     pub fn subscribe_events_for_test(&self) -> broadcast::Receiver<FcpResult<EventEnvelope>> {
         self.event_tx.subscribe()
+    }
+
+    /// Attach the host's acknowledged native transport once before handshake.
+    pub fn attach_event_stream(&mut self, stream: JsonlEventStream) -> FcpResult<()> {
+        if self.verifier.is_some() || self.event_stream.is_some() {
+            return Err(FcpError::InvalidRequest {
+                code: 1003,
+                message: "Signal event transport must be attached once before handshake".into(),
+            });
+        }
+        self.event_stream = Some(stream);
+        Ok(())
+    }
+
+    /// Authorize a host-issued stream and start delivery with one ACK in flight.
+    pub async fn handle_native_subscribe(&mut self, params: Value) -> FcpResult<Value> {
+        self.base.check_ready()?;
+        let config = self.config.as_ref().ok_or(FcpError::NotConfigured)?;
+        if !config.streaming.enabled {
+            return Err(FcpError::StreamingNotSupported);
+        }
+        if !self
+            .granted_capabilities
+            .iter()
+            .any(|cap| cap.as_str() == CAP_READ)
+        {
+            return Err(FcpError::Unauthorized {
+                code: 2001,
+                message: "Signal read authority was not negotiated in this session".into(),
+            });
+        }
+        let stream_id = params
+            .get("stream_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| FcpError::InvalidRequest {
+                code: 1003,
+                message: "subscribe requires a host-issued stream_id".into(),
+            })?
+            .to_owned();
+        let request: SubscribeRequest =
+            serde_json::from_value(params).map_err(|_| FcpError::InvalidRequest {
+                code: 1003,
+                message: "Invalid Signal subscribe request".into(),
+            })?;
+        if request.r#type != "subscribe"
+            || request.topics.len() != 1
+            || !request.topics.first().is_some_and(|topic| {
+                topic == EVENT_ALL || known_event_topics().contains(&topic.as_str())
+            })
+            || request.since.is_some()
+            || request.max_events_per_sec.is_some()
+            || request.batch_ms.is_some()
+        {
+            return Err(FcpError::InvalidRequest {
+                code: 1003,
+                message: "Signal native subscribe requires one exact topic without replay, batching, or rate options".into(),
+            });
+        }
+        let token = request
+            .capability_token
+            .ok_or_else(|| FcpError::Unauthorized {
+                code: 2001,
+                message: "Signal event subscription requires a capability token".into(),
+            })?;
+        let verifier = self
+            .verifier
+            .as_ref()
+            .ok_or(FcpError::NotHandshaken)?
+            .clone();
+        let stream = self
+            .event_stream
+            .as_ref()
+            .ok_or_else(|| {
+                signal_stream_unavailable("Signal native event transport is unavailable")
+            })?
+            .clone();
+        let topic = request.topics[0].clone();
+        let subscription = Arc::new(SignalNativeSubscription {
+            stream: stream.clone(),
+            stream_id: stream_id.clone(),
+            topic: topic.clone(),
+            token: Mutex::new(token),
+            verifier,
+        });
+        subscription.verify_authority()?;
+        if self
+            .native_stream_identity
+            .as_ref()
+            .is_some_and(|identity| identity.0 != stream_id || identity.1 != topic)
+        {
+            return Err(FcpError::InvalidRequest {
+                code: 1003,
+                message: "Changing Signal native stream identity requires reconfiguration".into(),
+            });
+        }
+        if !stream.is_open() {
+            // stream_close is read independently of RPC dispatch. Fence an
+            // idle producer before reopening instead of waiting for its next
+            // provider event or heartbeat to notice the closed transport.
+            self.stream.stop();
+        }
+        stream.open(&stream_id, &topic, request.window_size.unwrap_or(1))?;
+        if let Some(active) = self
+            .event_subscription
+            .as_ref()
+            .filter(|active| active.stream_id == stream_id && active.topic == topic)
+        {
+            *lock_unpoisoned(&active.token) = lock_unpoisoned(&subscription.token).clone();
+        } else {
+            self.event_subscription = Some(subscription);
+        }
+        self.native_stream_identity = Some((stream_id, topic.clone()));
+        lock_unpoisoned(&self.subscribed_topics).clone_from(&vec![topic.clone()]);
+        let client = self.client.as_ref().ok_or(FcpError::NotConfigured)?;
+        let bridge = self.bridge.as_ref().ok_or(FcpError::NotConfigured)?;
+        if let Err(error) = self.ensure_stream_running(config, client, Arc::clone(bridge)) {
+            stream.close();
+            self.event_subscription = None;
+            return Err(error);
+        }
+        serde_json::to_value(SubscribeResponse {
+            r#type: "response".into(),
+            id: request.id,
+            result: SubscribeResult {
+                confirmed_topics: vec![topic],
+                cursors: HashMap::new(),
+                replay_supported: false,
+                buffer: None,
+            },
+        })
+        .map_err(|_| FcpError::Internal {
+            message: "Failed to serialize Signal subscribe response".into(),
+        })
     }
 
     fn manifest_hash() -> String {
@@ -479,6 +843,9 @@ impl SignalConnector {
 
     fn stop_stream(&self) {
         self.stream.stop();
+        if let Some(stream) = &self.event_stream {
+            stream.close();
+        }
     }
 
     fn ensure_stream_running(
@@ -487,14 +854,17 @@ impl SignalConnector {
         client: &SignalClient,
         bridge: Arc<BridgeManager>,
     ) -> FcpResult<bool> {
+        let mut control = lock_unpoisoned(&self.stream.control);
+        if control
+            .task
+            .as_ref()
+            .is_some_and(|task| !task.is_finished())
         {
-            let task_guard = lock_unpoisoned(&self.stream.task);
-            if task_guard.as_ref().is_some_and(|task| !task.is_finished()) {
-                return Ok(false);
-            }
+            return Ok(false);
         }
-
-        self.stream.stop();
+        control.epoch = Arc::new(());
+        let epoch = Arc::clone(&control.epoch);
+        let resume_event_id = control.resume_event_id.clone();
 
         let stream_url = client
             .event_stream_url()
@@ -502,12 +872,26 @@ impl SignalConnector {
             .to_string();
         let policy = config.inbound_policy.clone();
         let account = config.normalized_phone_number();
-        let event_tx = self.event_tx.clone();
-        let topics = Arc::clone(&self.subscribed_topics);
-        let next_event_seq = Arc::clone(&self.next_event_seq);
-        let connector_id = self.base.id.clone();
-        let instance_id = self.base.instance_id.clone();
-        let base = Arc::clone(&self.base);
+        let native = self.event_subscription.clone();
+        let delivery = Arc::new(SignalDeliveryContext {
+            account: account.clone(),
+            bridge,
+            event_tx: self.event_tx.clone(),
+            topics: Arc::clone(&self.subscribed_topics),
+            next_event_seq: Arc::clone(&self.next_event_seq),
+            connector_id: self.base.id.clone(),
+            instance_id: self.base.instance_id.clone(),
+            base: Arc::clone(&self.base),
+            stream: Arc::clone(&self.stream),
+            epoch,
+            native: native.clone(),
+            zone: self
+                .verifier
+                .as_ref()
+                .ok_or(FcpError::NotHandshaken)?
+                .zone_id
+                .clone(),
+        });
         let supervisor_config = SupervisorConfig {
             base_backoff_ms: config.streaming.reconnect_initial_ms,
             max_backoff_ms: config.streaming.reconnect_max_ms,
@@ -522,11 +906,14 @@ impl SignalConnector {
             .with_reconnect_delay(Duration::from_millis(config.streaming.reconnect_initial_ms));
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        *lock_unpoisoned(&self.stream.shutdown_tx) = Some(shutdown_tx.clone());
+        control.shutdown_tx = Some(shutdown_tx.clone());
 
         let task = fcp_async_core::task::spawn(async move {
-            let mut supervisor =
-                StreamingSupervisor::new(supervisor_config, InMemoryStreamingSession::new());
+            let mut session = InMemoryStreamingSession::new();
+            if let Some(resume_event_id) = resume_event_id {
+                session.set_resume_token(resume_event_id);
+            }
+            let mut supervisor = StreamingSupervisor::new(supervisor_config, session);
             let outcome = supervisor
                 .run(
                     shutdown_rx,
@@ -536,7 +923,13 @@ impl SignalConnector {
                         let policy = policy.clone();
                         let account = account.clone();
                         let last_event_id = session.resume_token();
+                        let native = native.clone();
                         async move {
+                            if let Some(native) = native {
+                                native
+                                    .require_active()
+                                    .map_err(|error| -> StreamingError { Box::new(error) })?;
+                            }
                             connect_signal_sse_once(
                                 stream_url,
                                 sse_config,
@@ -550,37 +943,21 @@ impl SignalConnector {
                     |frame, session| {
                         session.record_heartbeat_ack(Instant::now());
                         if let Some(event_id) = frame.event_id.as_ref() {
-                            session.set_resume_token(event_id.clone());
+                            if event_id.is_empty() {
+                                session.clear_resume_token();
+                            } else {
+                                session.set_resume_token(event_id.clone());
+                            }
                         }
-                        let bridge = Arc::clone(&bridge);
-                        let event_tx = event_tx.clone();
-                        let topics = Arc::clone(&topics);
-                        let connector_id = connector_id.clone();
-                        let instance_id = instance_id.clone();
-                        let next_event_seq = Arc::clone(&next_event_seq);
-                        let base = Arc::clone(&base);
+                        // This provisional session token is reusable only if
+                        // the handler succeeds. The SDK fences failed handlers;
+                        // replacement workers use delivery's committed token.
+                        let delivery = Arc::clone(&delivery);
                         async move {
-                            if let Some(cursor) = frame.cursor.as_ref() {
-                                bridge.advance_cursor(cursor.clone());
-                            }
-
-                            let mut envelope =
-                                signal_stream_frame_to_envelope(frame, &connector_id, &instance_id)
-                                    .map_err(|error| -> StreamingError { Box::new(error) })?;
-                            let seq = next_event_seq.fetch_add(1, Ordering::Relaxed);
-                            envelope = envelope.with_seq(seq);
-                            if envelope.cursor.is_empty() {
-                                envelope = envelope.with_cursor_seq(seq);
-                            }
-                            let topic_allowed = {
-                                let subscribed = lock_unpoisoned(&topics);
-                                subscribed.iter().any(|topic| topic == &envelope.topic)
-                            };
-                            if topic_allowed {
-                                base.record_event();
-                                let _ = event_tx.send(Ok(envelope));
-                            }
-                            Ok(())
+                            delivery
+                                .deliver(frame)
+                                .await
+                                .map_err(|error| -> StreamingError { Box::new(error) })
                         }
                     },
                 )
@@ -590,7 +967,7 @@ impl SignalConnector {
             let _ = shutdown_tx.send(true);
         });
 
-        *lock_unpoisoned(&self.stream.task) = Some(task);
+        control.task = Some(task);
         Ok(true)
     }
 
@@ -810,7 +1187,7 @@ const fn signal_event_caps() -> EventCaps {
         streaming: true,
         replay: false,
         min_buffer_events: 100,
-        requires_ack: false,
+        requires_ack: true,
     }
 }
 
@@ -818,6 +1195,18 @@ const fn signal_event_caps() -> EventCaps {
 #[must_use]
 pub fn events_info() -> Vec<EventInfo> {
     vec![
+        EventInfo {
+            topic: EVENT_ALL.into(),
+            schema: json!({
+                "type": "object",
+                "required": ["source_topic", "event"],
+                "properties": {
+                    "source_topic": {"type": "string", "enum": known_event_topics()},
+                    "event": {"type": "object"}
+                }
+            }),
+            requires_ack: true,
+        },
         EventInfo {
             topic: EVENT_MESSAGE_RECEIVED.into(),
             schema: json!({
@@ -835,7 +1224,7 @@ pub fn events_info() -> Vec<EventInfo> {
                     "quote_author": { "type": "string" }
                 }
             }),
-            requires_ack: false,
+            requires_ack: true,
         },
         EventInfo {
             topic: EVENT_REACTION_RECEIVED.into(),
@@ -858,7 +1247,7 @@ pub fn events_info() -> Vec<EventInfo> {
                     }
                 }
             }),
-            requires_ack: false,
+            requires_ack: true,
         },
         EventInfo {
             topic: EVENT_RECEIPT_READ.into(),
@@ -872,7 +1261,7 @@ pub fn events_info() -> Vec<EventInfo> {
                     "receipt": { "type": "object" }
                 }
             }),
-            requires_ack: false,
+            requires_ack: true,
         },
         EventInfo {
             topic: EVENT_TYPING_RECEIVED.into(),
@@ -886,7 +1275,7 @@ pub fn events_info() -> Vec<EventInfo> {
                     "typing": { "type": "object" }
                 }
             }),
-            requires_ack: false,
+            requires_ack: true,
         },
         EventInfo {
             topic: EVENT_POLICY_DENIED.into(),
@@ -900,7 +1289,7 @@ pub fn events_info() -> Vec<EventInfo> {
                     "kind": { "type": "string" }
                 }
             }),
-            requires_ack: false,
+            requires_ack: true,
         },
     ]
 }
@@ -1161,6 +1550,21 @@ impl FcpConnector for SignalConnector {
 
     async fn configure(&mut self, config: serde_json::Value) -> FcpResult<()> {
         self.stop_stream();
+        self.event_subscription = None;
+        self.native_stream_identity = None;
+        self.verifier = None;
+        self.granted_capabilities.clear();
+        self.base.set_handshaken(false);
+        lock_unpoisoned(&self.subscribed_topics).clear();
+        lock_unpoisoned(&self.stream.control).resume_event_id = None;
+        if let Some(runtime) = &self.runtime {
+            runtime.shutdown();
+        }
+        self.base.set_configured(false);
+        self.config = None;
+        self.client = None;
+        self.runtime = None;
+        self.bridge = None;
         let chat_coordination_config = parse_signal_chat_coordination_config(
             config.get("chat_coordination"),
             self.chat_coordination_config.clone(),
@@ -1191,13 +1595,21 @@ impl FcpConnector for SignalConnector {
     }
 
     async fn handshake(&mut self, req: HandshakeRequest) -> FcpResult<HandshakeResponse> {
+        if self.verifier.is_some() {
+            return Err(FcpError::InvalidRequest {
+                code: 1003,
+                message: "Signal handshake replacement requires reconfiguration".into(),
+            });
+        }
         if let Some(requested_instance_id) = req.requested_instance_id {
-            let base = Arc::get_mut(&mut self.base).ok_or_else(|| FcpError::Internal {
-                message:
-                    "Signal connector instance id cannot change after shared runtime state exists"
-                        .into(),
-            })?;
-            base.instance_id = requested_instance_id;
+            if requested_instance_id != self.base.instance_id {
+                let base = Arc::get_mut(&mut self.base).ok_or_else(|| FcpError::Internal {
+                    message:
+                        "Signal connector instance id cannot change while the previous runtime is draining"
+                            .into(),
+                })?;
+                base.instance_id = requested_instance_id;
+            }
         }
         self.base.set_handshaken(true);
         self.verifier = Some(CapabilityVerifier::new(
@@ -1206,9 +1618,15 @@ impl FcpConnector for SignalConnector {
             self.base.instance_id.clone(),
         ));
 
-        let capabilities_granted = req
+        self.granted_capabilities = req
             .capabilities_requested
             .into_iter()
+            .filter(|cap| matches!(cap.as_str(), CAP_READ | CAP_SEND | CAP_ADMIN))
+            .collect();
+        let capabilities_granted = self
+            .granted_capabilities
+            .iter()
+            .cloned()
             .map(|cap| CapabilityGrant {
                 capability: cap,
                 operation: None,
@@ -1297,12 +1715,22 @@ impl FcpConnector for SignalConnector {
     async fn shutdown(&mut self, _req: ShutdownRequest) -> FcpResult<()> {
         self.stop_stream();
         lock_unpoisoned(&self.subscribed_topics).clear();
+        lock_unpoisoned(&self.stream.control).resume_event_id = None;
+        self.event_subscription = None;
+        self.native_stream_identity = None;
+        self.verifier = None;
+        self.granted_capabilities.clear();
+        self.base.set_handshaken(false);
+        self.base.set_configured(false);
         if let Some(bridge) = &mut self.bridge {
             bridge.reset();
         }
         if let Some(runtime) = &self.runtime {
             runtime.shutdown();
         }
+        self.config = None;
+        self.client = None;
+        self.runtime = None;
         Ok(())
     }
 
@@ -1323,6 +1751,12 @@ impl FcpConnector for SignalConnector {
     }
 
     async fn subscribe(&self, req: SubscribeRequest) -> FcpResult<SubscribeResponse> {
+        if self.event_stream.is_some() {
+            return Err(FcpError::InvalidRequest {
+                code: 1003,
+                message: "Use the host-issued Signal native subscribe path".into(),
+            });
+        }
         let config = self.config.as_ref().ok_or(FcpError::NotConfigured)?;
         if !config.streaming.enabled {
             return Err(FcpError::StreamingNotSupported);
@@ -1382,6 +1816,7 @@ impl FcpConnector for SignalConnector {
 impl SignalConnector {
     #[allow(clippy::too_many_lines)]
     async fn invoke_inner(&self, req: InvokeRequest) -> FcpResult<InvokeResponse> {
+        self.base.check_ready()?;
         let operation = req.operation.as_str();
 
         if let Some(verifier) = &self.verifier {
@@ -1990,7 +2425,7 @@ mod tests {
         let connector = SignalConnector::new();
         let intro = connector.introspect();
         assert_eq!(intro.operations.len(), 6);
-        assert_eq!(intro.events.len(), 5);
+        assert_eq!(intro.events.len(), 6);
         assert!(
             intro
                 .operations
@@ -2733,5 +3168,294 @@ mod tests {
             .await
             .unwrap();
         server.join().expect("Signal SSE server thread");
+    }
+
+    #[derive(Clone)]
+    struct NativeTestOutput(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for NativeTestOutput {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            lock_unpoisoned(&self.0).extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    async fn native_delivery_fixture() -> (
+        SignalConnector,
+        SignalDeliveryContext,
+        JsonlEventStream,
+        Arc<Mutex<Vec<u8>>>,
+    ) {
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let stream = JsonlEventStream::new(JsonlWriter::new(NativeTestOutput(Arc::clone(&output))));
+        let mut connector = SignalConnector::new();
+        connector.attach_event_stream(stream.clone()).unwrap();
+        connector
+            .configure(json!({"phone_number": "+15551234567", "daemon_url": "http://127.0.0.1:1"}))
+            .await
+            .unwrap();
+        let (handshake, token) = signed_token_for(
+            CAP_READ,
+            NATIVE_SUBSCRIBE_OPERATION,
+            &connector.base.instance_id,
+        );
+        connector.handshake(handshake).await.unwrap();
+        stream.open("signal-native", EVENT_ALL, 1).unwrap();
+        let native = Arc::new(SignalNativeSubscription {
+            stream: stream.clone(),
+            stream_id: "signal-native".into(),
+            topic: EVENT_ALL.into(),
+            token: Mutex::new(token),
+            verifier: connector.verifier.clone().unwrap(),
+        });
+        let epoch = Arc::clone(&lock_unpoisoned(&connector.stream.control).epoch);
+        let context = SignalDeliveryContext {
+            account: "+15551234567".into(),
+            bridge: connector.bridge.clone().unwrap(),
+            event_tx: connector.event_tx.clone(),
+            topics: Arc::clone(&connector.subscribed_topics),
+            next_event_seq: Arc::clone(&connector.next_event_seq),
+            connector_id: connector.base.id.clone(),
+            instance_id: connector.base.instance_id.clone(),
+            base: Arc::clone(&connector.base),
+            stream: Arc::clone(&connector.stream),
+            epoch,
+            native: Some(native),
+            zone: ZoneId::work(),
+        };
+        (connector, context, stream, output)
+    }
+
+    fn native_message_frame(id: &str) -> SignalStreamFrame {
+        let raw = SseEvent::new(
+            json!({
+                "envelope": {
+                    "sourceNumber": "+15559876543", "timestamp": 1700000001000_u64,
+                    "dataMessage": {"message": "native delivery"}
+                }
+            })
+            .to_string(),
+        )
+        .with_event("receive")
+        .with_id(id);
+        signal_stream_frame_from_sse_event(&raw, &SignalInboundPolicy::default(), "+15551234567")
+            .unwrap()
+            .unwrap()
+    }
+
+    fn captured_native_ack(output: &Arc<Mutex<Vec<u8>>>) -> Value {
+        let event: Value = serde_json::from_slice(&lock_unpoisoned(output)).unwrap();
+        assert_eq!(event["method"], "event");
+        assert_eq!(event["params"]["event"]["data"]["zone_id"], "z:work");
+        assert_eq!(
+            event["params"]["event"]["data"]["payload"]["source_topic"],
+            EVENT_MESSAGE_RECEIVED
+        );
+        assert_eq!(event["params"]["event"]["requires_ack"], true);
+        json!({
+            "stream_id": event["params"]["stream_id"],
+            "ack": {
+                "type": "ack", "topic": event["params"]["event"]["topic"],
+                "seqs": [event["params"]["event"]["seq"]],
+                "cursors": [event["params"]["event"]["cursor"]]
+            }
+        })
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn native_signal_cursor_advances_only_after_exact_host_ack() {
+        let (connector, context, stream, output) = native_delivery_fixture().await;
+        let mut delivery = std::pin::pin!(context.deliver(native_message_frame("native-1")));
+        assert!(futures_util::poll!(delivery.as_mut()).is_pending());
+        assert!(connector.bridge().unwrap().receive_cursor().is_none());
+        assert!(
+            lock_unpoisoned(&connector.stream.control)
+                .resume_event_id
+                .is_none()
+        );
+        let ack = captured_native_ack(&output);
+        let mut wrong = ack.clone();
+        wrong["ack"]["cursors"] = json!(["wrong-cursor"]);
+        assert!(stream.acknowledge(wrong).is_err());
+        assert!(futures_util::poll!(delivery.as_mut()).is_pending());
+        stream.acknowledge(ack).unwrap();
+        delivery.await.unwrap();
+        assert_eq!(
+            connector.bridge().unwrap().receive_cursor().as_deref(),
+            Some("native-1")
+        );
+        assert_eq!(
+            lock_unpoisoned(&connector.stream.control)
+                .resume_event_id
+                .as_deref(),
+            Some("native-1")
+        );
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn native_signal_close_and_stale_generation_never_commit_progress() {
+        for retire_before_ack in [false, true] {
+            let (connector, context, stream, output) = native_delivery_fixture().await;
+            let mut delivery = std::pin::pin!(context.deliver(native_message_frame("uncommitted")));
+            assert!(futures_util::poll!(delivery.as_mut()).is_pending());
+            if retire_before_ack {
+                // Even an already received ACK cannot let a retired producer
+                // modify the new session's progress.
+                stream.acknowledge(captured_native_ack(&output)).unwrap();
+                connector.stream.stop();
+            } else {
+                stream.close();
+            }
+            assert!(delivery.await.is_err());
+            assert!(connector.bridge().unwrap().receive_cursor().is_none());
+            assert!(
+                lock_unpoisoned(&connector.stream.control)
+                    .resume_event_id
+                    .is_none()
+            );
+        }
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn native_signal_rechecks_authority_after_ack() {
+        let (connector, context, stream, output) = native_delivery_fixture().await;
+        let mut delivery = std::pin::pin!(context.deliver(native_message_frame("revoked")));
+        assert!(futures_util::poll!(delivery.as_mut()).is_pending());
+        *lock_unpoisoned(&context.native.as_ref().unwrap().token) = CapabilityToken::test_token();
+        stream.acknowledge(captured_native_ack(&output)).unwrap();
+        assert!(delivery.await.is_err());
+        assert!(connector.bridge().unwrap().receive_cursor().is_none());
+        assert!(
+            lock_unpoisoned(&connector.stream.control)
+                .resume_event_id
+                .is_none()
+        );
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn signal_embedded_delivery_failure_does_not_consume_sse_cursor() {
+        let (connector, mut context, _stream, _output) = native_delivery_fixture().await;
+        context.native = None;
+        lock_unpoisoned(&context.topics).push(EVENT_MESSAGE_RECEIVED.into());
+        assert!(
+            context
+                .deliver(native_message_frame("retry-me"))
+                .await
+                .is_err()
+        );
+        assert!(connector.bridge().unwrap().receive_cursor().is_none());
+        assert!(
+            lock_unpoisoned(&connector.stream.control)
+                .resume_event_id
+                .is_none()
+        );
+        let mut events = connector.subscribe_events_for_test();
+        context
+            .deliver(native_message_frame("retry-me"))
+            .await
+            .unwrap();
+        assert_eq!(events.recv().await.unwrap().unwrap().cursor, "retry-me");
+        assert_eq!(
+            connector.bridge().unwrap().receive_cursor().as_deref(),
+            Some("retry-me")
+        );
+    }
+
+    #[test]
+    fn native_signal_identity_is_stable_and_distinguishes_timestamp_collisions() {
+        let first = signal_stream_frame_to_envelope(
+            native_message_frame(""),
+            &ConnectorId::from_static("fcp.signal"),
+            &InstanceId::new(),
+        )
+        .unwrap();
+        let mut second = first.clone();
+        second.data.payload["body"] = json!("another message at the same time");
+        assert_eq!(
+            first.data.payload["timestamp"],
+            second.data.payload["timestamp"]
+        );
+        let first_cursor = signal_native_event_cursor("+15551234567", None, &first).unwrap();
+        assert_ne!(
+            first_cursor,
+            signal_native_event_cursor("+15551234567", None, &second).unwrap()
+        );
+        assert_eq!(
+            first_cursor,
+            signal_native_event_cursor("+15551234567", None, &first.clone().with_seq(999)).unwrap()
+        );
+        assert_ne!(
+            first_cursor,
+            signal_native_event_cursor("+15557654321", None, &first).unwrap()
+        );
+        assert_eq!(
+            signal_native_event_cursor("+15551234567", Some("provider-id"), &first).unwrap(),
+            signal_native_event_cursor("+15551234567", Some("provider-id"), &second).unwrap(),
+            "provider ID reused with conflicting content must remain detectable by the host",
+        );
+        assert!(!first_cursor.contains("15551234567"));
+        assert!(first_cursor.len() < 100);
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn native_signal_idle_close_reopens_without_waiting_for_provider_activity() {
+        let (mut connector, context, stream, _output) = native_delivery_fixture().await;
+        let native = context.native.as_ref().unwrap();
+        let token = lock_unpoisoned(&native.token).clone();
+        connector.event_subscription = Some(Arc::clone(native));
+        connector.native_stream_identity = Some(("signal-native".into(), EVENT_ALL.into()));
+        lock_unpoisoned(&connector.stream.control).task =
+            Some(fcp_async_core::task::spawn(async {
+                std::future::pending::<()>().await;
+            }));
+        stream
+            .close_named(&json!({"stream_id":"signal-native"}))
+            .unwrap();
+        assert!(connector.stream.is_running());
+        let response = connector
+            .handle_native_subscribe(json!({
+                "type":"subscribe", "id":"reopen", "stream_id":"signal-native",
+                "topics":[EVENT_ALL], "capability_token":token
+            }))
+            .await
+            .unwrap();
+        assert_eq!(response["result"]["confirmed_topics"], json!([EVENT_ALL]));
+        assert!(!Arc::ptr_eq(
+            &context.epoch,
+            &lock_unpoisoned(&connector.stream.control).epoch
+        ));
+        connector.stop_stream();
+        assert!(
+            context
+                .deliver(native_message_frame("stale"))
+                .await
+                .is_err()
+        );
+        assert!(connector.bridge().unwrap().receive_cursor().is_none());
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn native_signal_subscription_grant_does_not_authorize_queue_reads() {
+        let (mut connector, context, _stream, _output) = native_delivery_fixture().await;
+        let native = context.native.as_ref().unwrap();
+        native.verify_authority().unwrap();
+        let request = InvokeRequest {
+            capability_token: lock_unpoisoned(&native.token).clone(),
+            ..base_invoke(connector.id(), OP_RECEIVE_MESSAGES)
+        };
+        assert!(connector.invoke(request).await.is_err());
+        // Even a valid token cannot add read authority omitted from handshake.
+        connector.granted_capabilities.clear();
+        let result = connector
+            .handle_native_subscribe(json!({
+                "type":"subscribe", "id":"not-negotiated", "stream_id":"signal-native",
+                "topics":[EVENT_ALL], "capability_token":lock_unpoisoned(&native.token).clone()
+            }))
+            .await;
+        assert!(matches!(result, Err(FcpError::Unauthorized { .. })));
     }
 }

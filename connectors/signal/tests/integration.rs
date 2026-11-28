@@ -6,7 +6,7 @@
 )]
 
 use std::fmt::Write as _;
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 use std::str::FromStr as _;
 use std::thread;
@@ -53,6 +53,196 @@ const EVENT_MESSAGE_RECEIVED: &str = "signal.message.received";
 const EVENT_REACTION_RECEIVED: &str = "signal.reaction.received";
 const EVENT_TYPING_RECEIVED: &str = "signal.typing.received";
 const EVENT_POLICY_DENIED: &str = "signal.policy.denied";
+
+struct NativeSignalProcess(std::process::Child);
+
+impl Drop for NativeSignalProcess {
+    fn drop(&mut self) {
+        if self.0.try_wait().ok().flatten().is_none() {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+}
+
+#[test]
+fn native_stdio_streams_daemon_events_with_host_ack_credit_and_shutdown() {
+    let body = signal_sse_body(&[
+        (
+            "native-first",
+            json!({"envelope": {
+                "sourceNumber": RECIPIENT,
+                "dataMessage": {"message": "first native event"}
+            }}),
+        ),
+        (
+            "native-second",
+            json!({"envelope": {
+                "sourceNumber": RECIPIENT,
+                "dataMessage": {"message": "second native event"}
+            }}),
+        ),
+    ]);
+    let (daemon_url, daemon) = spawn_signal_sse_server(body);
+    let mut child = NativeSignalProcess(
+        std::process::Command::new(env!("CARGO_BIN_EXE_fcp-signal"))
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("start native Signal process"),
+    );
+    let mut input = child.0.stdin.take().unwrap();
+    let output = child.0.stdout.take().unwrap();
+    let (frames_tx, frames_rx) = std::sync::mpsc::channel();
+    let reader = thread::spawn(move || {
+        for line in BufReader::new(output).lines() {
+            let Ok(line) = line else { break };
+            let frame: Value =
+                serde_json::from_str(&line).expect("stdout must contain JSON frames only");
+            if frames_tx.send(frame).is_err() {
+                break;
+            }
+        }
+    });
+    let send = |input: &mut std::process::ChildStdin, request: Value| {
+        writeln!(input, "{request}").unwrap();
+        input.flush().unwrap();
+    };
+    let receive = || {
+        frames_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("bounded native Signal frame wait")
+    };
+    let key = Ed25519SigningKey::generate();
+    let instance = InstanceId::new();
+    let mut config = sse_config(&daemon_url);
+    config["streaming"]["stale_after_ms"] = json!(30_000);
+    send(
+        &mut input,
+        json!({"id":"config", "method":"configure", "params":config}),
+    );
+    assert_eq!(receive()["result"]["status"], "configured");
+    send(
+        &mut input,
+        json!({"id":"handshake", "method":"handshake", "params":handshake_request(&key, &instance)}),
+    );
+    assert_eq!(receive()["result"]["event_caps"]["requires_ack"], true);
+    let token = valid_token(
+        &key,
+        &instance,
+        "signal.subscribe",
+        CAP_READ,
+        &ZoneId::work(),
+    );
+    send(
+        &mut input,
+        json!({"id":"subscribe", "method":"subscribe", "params":{
+            "type":"subscribe", "id":"signal_subscribe", "stream_id":"signal_native_test",
+            "topics":["signal.events"], "window_size":1, "capability_token":token
+        }}),
+    );
+    let mut first = None;
+    let mut subscribed = false;
+    for _ in 0..2 {
+        let frame = receive();
+        if frame["method"] == "event" {
+            first = Some(frame);
+        } else {
+            assert_eq!(frame["id"], "subscribe");
+            assert_eq!(
+                frame["result"]["result"]["confirmed_topics"],
+                json!(["signal.events"])
+            );
+            subscribed = true;
+        }
+    }
+    assert!(subscribed);
+    let first = first.expect("native event must arrive without a subsequent RPC");
+    let event = &first["params"]["event"];
+    assert!(event["cursor"].as_str().unwrap().starts_with("signal:v1:"));
+    assert_eq!(event["requires_ack"], true);
+    assert_eq!(
+        event["data"]["instance_id"],
+        serde_json::to_value(&instance).unwrap()
+    );
+    assert_eq!(event["data"]["zone_id"], "z:work");
+    assert_eq!(
+        event["data"]["payload"]["source_topic"],
+        EVENT_MESSAGE_RECEIVED
+    );
+    assert_eq!(
+        event["data"]["payload"]["event"]["body"],
+        "first native event"
+    );
+    assert!(matches!(
+        frames_rx.recv_timeout(Duration::from_millis(100)),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+    ));
+
+    // A normal RPC is served while the background handler is awaiting ACK.
+    send(
+        &mut input,
+        json!({"id":"pending_health", "method":"health", "params":{}}),
+    );
+    let health = receive();
+    assert_eq!(health["id"], "pending_health");
+    assert_eq!(
+        health["result"]["details"]["bridge"]["has_receive_cursor"],
+        false
+    );
+    send(
+        &mut input,
+        json!({"method":"ack", "params":{
+            "stream_id":"signal_native_test", "ack":{
+                "type":"ack", "topic":"signal.events", "seqs":[event["seq"]], "cursors":["wrong"]
+            }
+        }}),
+    );
+    assert!(matches!(
+        frames_rx.recv_timeout(Duration::from_millis(100)),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+    ));
+    send(
+        &mut input,
+        json!({"method":"ack", "params":{
+            "stream_id":"signal_native_test", "ack":{
+                "type":"ack", "topic":"signal.events", "seqs":[event["seq"]], "cursors":[event["cursor"]]
+            }
+        }}),
+    );
+    let second = receive();
+    assert_eq!(second["method"], "event");
+    assert_ne!(second["params"]["event"]["cursor"], event["cursor"]);
+    assert_eq!(
+        second["params"]["event"]["data"]["payload"]["event"]["body"],
+        "second native event"
+    );
+    // Shutdown must close the unacknowledged second event and terminate even
+    // though stdin remains open. A closed pipe never counts as an ACK.
+    send(
+        &mut input,
+        json!({"id":"shutdown", "method":"shutdown", "params":{
+            "type":"shutdown", "deadline_ms":1_000, "drain":false
+        }}),
+    );
+    assert_eq!(receive()["result"]["status"], "shutdown_accepted");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(status) = child.0.try_wait().unwrap() {
+            assert!(status.success());
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "native Signal process must exit after shutdown"
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+    drop(input);
+    reader.join().unwrap();
+    daemon.join().unwrap();
+}
 
 #[fcp_async_core::runtime::test]
 async fn lifecycle_loopback_send_receive_health_shutdown_and_jsonl_logging() {

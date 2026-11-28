@@ -453,7 +453,10 @@ description = "Authorized Signal message or attachment event accepted after dire
 streaming = true
 replay = false
 topic = "signal.message.received"
-requires_ack = false
+requires_ack = true
+capability = "signal.read"
+subscribe_operation = "signal.subscribe"
+resource_uri = "signal:events:signal.message.received"
 
 [provides.events."signal.message.received".schema]
 required = [
@@ -494,7 +497,10 @@ description = "Structured Signal policy-denial event for audit logs without mess
 streaming = true
 replay = false
 topic = "signal.policy.denied"
-requires_ack = false
+requires_ack = true
+capability = "signal.read"
+subscribe_operation = "signal.subscribe"
+resource_uri = "signal:events:signal.policy.denied"
 
 [provides.events."signal.policy.denied".schema]
 required = ["reason"]
@@ -517,7 +523,10 @@ description = "Authorized reaction-only Signal event accepted after the same sen
 streaming = true
 replay = false
 topic = "signal.reaction.received"
-requires_ack = false
+requires_ack = true
+capability = "signal.read"
+subscribe_operation = "signal.subscribe"
+resource_uri = "signal:events:signal.reaction.received"
 
 [provides.events."signal.reaction.received".schema]
 required = [
@@ -544,7 +553,10 @@ description = "Authorized Signal read/delivery receipt surfaced by signal-cli."
 streaming = true
 replay = false
 topic = "signal.receipt.read"
-requires_ack = false
+requires_ack = true
+capability = "signal.read"
+subscribe_operation = "signal.subscribe"
+resource_uri = "signal:events:signal.receipt.read"
 
 [provides.events."signal.receipt.read".schema]
 required = [
@@ -571,7 +583,10 @@ description = "Authorized Signal typing indicator surfaced by signal-cli."
 streaming = true
 replay = false
 topic = "signal.typing.received"
-requires_ack = false
+requires_ack = true
+capability = "signal.read"
+subscribe_operation = "signal.subscribe"
+resource_uri = "signal:events:signal.typing.received"
 
 [provides.events."signal.typing.received".schema]
 required = [
@@ -593,10 +608,32 @@ type = "string"
 [provides.events."signal.typing.received".schema.properties.typing]
 type = "object"
 
+[provides.events."signal.events"]
+description = "All normalized Signal inbound events on one acknowledged native host stream."
+streaming = true
+replay = false
+topic = "signal.events"
+requires_ack = true
+capability = "signal.read"
+subscribe_operation = "signal.subscribe"
+resource_uri = "signal:events:signal.events"
+
+[provides.events."signal.events".schema]
+type = "object"
+required = ["source_topic", "event"]
+
+[provides.events."signal.events".schema.properties.source_topic]
+type = "string"
+enum = ["signal.message.received", "signal.reaction.received", "signal.receipt.read", "signal.typing.received", "signal.policy.denied"]
+
+[provides.events."signal.events".schema.properties.event]
+type = "object"
+
 [event_caps]
 streaming = true
 replay = false
 min_buffer_events = 100
+requires_ack = true
 
 [sandbox]
 profile = "strict"

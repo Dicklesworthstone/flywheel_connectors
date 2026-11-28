@@ -26,6 +26,7 @@ const EVENT_REACTION_RECEIVED: &str = "signal.reaction.received";
 const EVENT_RECEIPT_READ: &str = "signal.receipt.read";
 const EVENT_TYPING_RECEIVED: &str = "signal.typing.received";
 const EVENT_POLICY_DENIED: &str = "signal.policy.denied";
+const EVENT_ALL: &str = "signal.events";
 
 #[test]
 fn signal_schema_operation_event_and_error_contracts_are_advertised() {
@@ -91,6 +92,7 @@ fn signal_schema_operation_event_and_error_contracts_are_advertised() {
     assert_eq!(event_caps["streaming"], true);
     assert_eq!(event_caps["replay"], false);
     assert_eq!(event_caps["min_buffer_events"], 100);
+    assert_eq!(event_caps["requires_ack"], true);
 
     let topics = introspection_events(&introspection)
         .iter()
@@ -99,7 +101,7 @@ fn signal_schema_operation_event_and_error_contracts_are_advertised() {
                 .as_str()
                 .expect("event topic should serialize as a string");
             assert_object_schema(&event["schema"], topic, "event schema");
-            assert_eq!(event["requires_ack"], false, "{topic} requires_ack drifted");
+            assert_eq!(event["requires_ack"], true, "{topic} requires_ack drifted");
             topic
         })
         .collect::<BTreeSet<_>>();
@@ -111,6 +113,7 @@ fn signal_schema_operation_event_and_error_contracts_are_advertised() {
             EVENT_RECEIPT_READ,
             EVENT_TYPING_RECEIVED,
             EVENT_POLICY_DENIED,
+            EVENT_ALL,
         ])
     );
 
@@ -349,6 +352,7 @@ fn signal_manifest_keeps_loopback_security_and_event_contracts_in_sync() {
             EVENT_RECEIPT_READ.to_string(),
             EVENT_TYPING_RECEIVED.to_string(),
             EVENT_POLICY_DENIED.to_string(),
+            EVENT_ALL.to_string(),
         ])
     );
     for (topic, event) in manifest_events {
@@ -361,8 +365,17 @@ fn signal_manifest_keeps_loopback_security_and_event_contracts_in_sync() {
             "{topic} must remain explicit no-replay"
         );
         assert!(
-            !bool_from(event, &["requires_ack"]),
-            "{topic} should not require event ack"
+            bool_from(event, &["requires_ack"]),
+            "{topic} must require host acknowledgement"
+        );
+        assert_eq!(event["capability"].as_str(), Some(CAP_READ));
+        assert_eq!(
+            event["subscribe_operation"].as_str(),
+            Some("signal.subscribe")
+        );
+        assert_eq!(
+            event["resource_uri"].as_str(),
+            Some(format!("signal:events:{topic}").as_str())
         );
         assert!(
             event.get("schema").is_some(),
