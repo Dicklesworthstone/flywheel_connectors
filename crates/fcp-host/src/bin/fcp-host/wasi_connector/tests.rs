@@ -2158,7 +2158,7 @@ async fn lifecycle_disable_enable_restart_and_uninstall_control_all_wasi_guests(
         uninstalled.current_desired_state,
         DesiredRuntimeState::Uninstalled
     );
-    assert_eq!(uninstalled.observed_state, ObservedRuntimeState::Stopped);
+    assert_eq!(uninstalled.observed_state, ObservedRuntimeState::Missing);
     assert!(retained.sessions.require_open().is_err());
     assert!(
         !fixture

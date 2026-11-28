@@ -3941,6 +3941,28 @@ A separate enum in `crates/fcp-core/src/connector_descriptors.rs` carries the ru
 
 These map to `DescriptorStatus::{ Ready, Degraded, Unavailable }` for the agent-facing discovery surface. `fwc status <connector>` surfaces both lifecycle state and health, plus the last 5 transitions.
 
+Host lifecycle reconciliation separates retained runtime ownership from explicit
+readiness checks. Its passive path does not call connector health or introspection
+methods, start a guest, or probe a child process. It preserves an existing
+observation only for the same runtime instance; a replacement cannot inherit the
+old instance's health. A single-connector lifecycle observation leaves other
+connectors' status and journal sequence untouched.
+
+Startup and managed lifecycle/configuration changes deliberately check readiness
+for enabled native runtimes. These checks require current execution authority
+and revalidate that authority and the inventory generation before recording the
+result. WASI readiness comes from its existing in-memory session state. Dormant,
+denied, and unresolved polling-custody entries are excluded from readiness-probe
+admission. A previously admitted health request may finish after revocation, but
+its result cannot overwrite the newer denial. Unavailable health reports
+`Degraded` and is never proof of process exit.
+
+Confirmed dormant entries report `Stopped` for disabled intent and `Missing` for
+uninstalled intent. Reconciliation preserves the operator's desired state. An
+interrupted Telegram checkpoint or unresolved source/replacement process forces
+a dormant or absent inventory observation to `Unknown`, so a host restart cannot
+erase unfinished custody or falsely report a successful stop.
+
 ### Checkpointed Telegram stop, removal, and resume
 
 For an admitted Linux native Telegram polling deployment, `Disable` saves the

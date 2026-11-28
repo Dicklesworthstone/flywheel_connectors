@@ -308,32 +308,18 @@ async fn observe_transition(
     connector_id: &ConnectorId,
     mut response: LifecycleTransitionResponse,
 ) -> HostResult<LifecycleTransitionResponse> {
-    let summary = state
-        .registry
-        .get(connector_id)
-        .await
-        .ok_or_else(|| HostError::ConnectorNotFound(connector_id.to_string()))?;
-    let observed = if !summary.enabled {
-        ObservedRuntimeState::Stopped
-    } else {
-        match summary.health {
-            ConnectorHealth::Healthy => ObservedRuntimeState::Running,
-            ConnectorHealth::Degraded { .. } => ObservedRuntimeState::Degraded,
-            // A failed health RPC is not proof that a native child or a guest
-            // stopped. Only publishing a dormant entry confirms retirement.
-            ConnectorHealth::Unavailable { .. } => ObservedRuntimeState::Degraded,
-        }
-    };
-    state
-        .lifecycle
-        .set_observed_state(connector_id, observed, Some("runtime-lifecycle".to_owned()))
+    // Observe only the selected owner. Enabled runtimes receive an explicit
+    // readiness check; dormant and denied owners retain passive custody facts.
+    // An unrelated connector's observation is never rewritten by this action.
+    let status = lifecycle_readiness::selected(&state.registry, &state.lifecycle, connector_id)
         .await
         .map_err(map_lifecycle_host_error)?;
-    let status = state
-        .lifecycle
-        .connector_status(connector_id)
-        .await
-        .map_err(map_lifecycle_host_error)?;
+    if status.desired_state != response.current_desired_state {
+        return Err(HostError::Unavailable(
+            "connector lifecycle intent changed before readiness was recorded; inspect current state before retrying"
+                .to_owned(),
+        ));
+    }
     response.observed_state = status.observed_state;
     response.journal_sequence = status.last_journal_sequence;
     Ok(response)
@@ -852,8 +838,7 @@ done"#
                 .await
                 .expect("construct lifecycle-aware registry"),
         );
-        lifecycle
-            .reconcile_registered_connectors(&registry.list().await)
+        lifecycle_readiness::full(&registry, &lifecycle)
             .await
             .expect("observe initial runtime");
         crate::tests::dispatcher_app_state(registry, lifecycle, None, HashMap::new())
@@ -943,10 +928,7 @@ done"#
                 .await
                 .expect("persisted denial must suppress even attempted executable launch"),
             );
-            lifecycle
-                .reconcile_registered_connectors(&registry.list().await)
-                .await
-                .unwrap();
+            registry.reconcile_lifecycle(&lifecycle).await.unwrap();
             let state =
                 crate::tests::dispatcher_app_state(registry, lifecycle, None, HashMap::new());
             assert_dormant(&state, &connector_id).await;
@@ -961,6 +943,11 @@ done"#
                 .apply_configs_with_lifecycle(vec![config.clone()], &state.lifecycle)
                 .await
                 .expect("managed reload retains dormant runtime authority");
+            state
+                .registry
+                .reconcile_lifecycle(&state.lifecycle)
+                .await
+                .unwrap();
             assert_dormant(&state, &connector_id).await;
             assert_eq!(
                 selected_entry(&state.registry, &connector_id)
@@ -976,7 +963,15 @@ done"#
                 .await
                 .unwrap();
             assert_eq!(status.desired_state, desired);
-            assert_eq!(status.observed_state, ObservedRuntimeState::Stopped);
+            assert_eq!(
+                status.observed_state,
+                if desired == DesiredRuntimeState::Uninstalled {
+                    ObservedRuntimeState::Missing
+                } else {
+                    ObservedRuntimeState::Stopped
+                }
+            );
+            assert!(status.drift.is_none());
         }
     }
 
@@ -1029,6 +1024,116 @@ done"#
                 .await
                 .is_err()
         );
+    }
+
+    #[fcp_async_core::runtime::test(flavor = "multi_thread")]
+    async fn lifecycle_observation_rejects_intent_superseded_before_readiness() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = app(
+            native_config(directory.path(), "stateless"),
+            DesiredRuntimeState::Enabled,
+        )
+        .await;
+        let connector_id = ConnectorId::from_static(CONNECTOR);
+        let response = state
+            .lifecycle
+            .execute_lifecycle_transition(&connector_id, &request(LifecycleAction::Enable))
+            .await
+            .unwrap();
+        state
+            .lifecycle
+            .set_desired_state(&connector_id, DesiredRuntimeState::Disabled, None)
+            .await
+            .unwrap();
+        let error = observe_transition(&state, &connector_id, response)
+            .await
+            .expect_err("a later denial must not return the old enabled transition as current");
+        assert!(error.to_string().contains("lifecycle intent changed"));
+        assert_eq!(
+            state
+                .lifecycle
+                .connector_status(&connector_id)
+                .await
+                .unwrap()
+                .desired_state,
+            DesiredRuntimeState::Disabled,
+        );
+        transition(&state, &connector_id, &request(LifecycleAction::Disable))
+            .await
+            .unwrap();
+    }
+
+    #[fcp_async_core::runtime::test(flavor = "multi_thread")]
+    async fn lifecycle_observation_keeps_other_rows_and_records_replacement_readiness() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = app(
+            native_config(directory.path(), "stateless"),
+            DesiredRuntimeState::Enabled,
+        )
+        .await;
+        let connector_id = ConnectorId::from_static(CONNECTOR);
+        let other = ConnectorId::from_static("fcp.test.lifecycle-history");
+        state
+            .lifecycle
+            .set_desired_state(&other, DesiredRuntimeState::Enabled, None)
+            .await
+            .unwrap();
+        state
+            .lifecycle
+            .set_observed_state(&other, ObservedRuntimeState::Degraded, None)
+            .await
+            .unwrap();
+        let other_before = state.lifecycle.connector_status(&other).await.unwrap();
+        let first = native(&state, &connector_id).await;
+        assert_eq!(
+            state
+                .lifecycle
+                .connector_status(&connector_id)
+                .await
+                .unwrap()
+                .observed_state,
+            ObservedRuntimeState::Running,
+        );
+        let passive = state
+            .registry
+            .reconcile_connector_lifecycle(&state.lifecycle, &connector_id)
+            .await
+            .unwrap();
+        assert_eq!(passive.observed_state, ObservedRuntimeState::Running);
+        assert_eq!(
+            state
+                .lifecycle
+                .connector_status(&other)
+                .await
+                .unwrap()
+                .last_journal_sequence,
+            other_before.last_journal_sequence,
+            "passive observation must preserve unrelated rows too",
+        );
+
+        for action in [LifecycleAction::Enable, LifecycleAction::Restart] {
+            let response = transition(&state, &connector_id, &request(action))
+                .await
+                .unwrap();
+            let current = native(&state, &connector_id).await;
+            if action == LifecycleAction::Enable {
+                assert!(Arc::ptr_eq(&first, &current));
+            } else {
+                assert!(!Arc::ptr_eq(&first, &current));
+                assert!(first.runtime_retirement.is_exited());
+            }
+            assert_eq!(response.observed_state, ObservedRuntimeState::Running);
+            let other_after = state.lifecycle.connector_status(&other).await.unwrap();
+            assert_eq!(other_after.desired_state, other_before.desired_state);
+            assert_eq!(other_after.observed_state, ObservedRuntimeState::Degraded);
+            assert_eq!(
+                other_after.last_journal_sequence, other_before.last_journal_sequence,
+                "a selected lifecycle transition must not reconcile unrelated inventory",
+            );
+        }
+        transition(&state, &connector_id, &request(LifecycleAction::Disable))
+            .await
+            .unwrap();
     }
 
     #[fcp_async_core::runtime::test(flavor = "multi_thread")]
@@ -1101,7 +1206,7 @@ done"#
             uninstalled.current_desired_state,
             DesiredRuntimeState::Uninstalled
         );
-        assert_eq!(uninstalled.observed_state, ObservedRuntimeState::Stopped);
+        assert_eq!(uninstalled.observed_state, ObservedRuntimeState::Missing);
         assert!(third.runtime_retirement.is_exited());
         assert_dormant(&state, &connector_id).await;
     }
@@ -1208,7 +1313,7 @@ done"#
             uninstalled.current_desired_state,
             DesiredRuntimeState::Uninstalled
         );
-        assert_eq!(uninstalled.observed_state, ObservedRuntimeState::Stopped);
+        assert_eq!(uninstalled.observed_state, ObservedRuntimeState::Missing);
         for process in &third_processes {
             assert!(process.runtime_retirement.is_exited());
         }

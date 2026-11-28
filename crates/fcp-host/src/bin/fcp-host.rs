@@ -16,7 +16,7 @@ use std::path::Path as FsPath;
 use std::path::{Path as StdPath, PathBuf};
 use std::pin::pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex as StdMutex, OnceLock};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
 use axum::{
@@ -184,6 +184,8 @@ mod guarded_invoke;
 mod http_batch;
 #[path = "fcp-host/invoke_jobs.rs"]
 mod invoke_jobs;
+#[path = "fcp-host/lifecycle_readiness.rs"]
+mod lifecycle_readiness;
 #[path = "fcp-host/lifecycle_runtime.rs"]
 mod lifecycle_runtime;
 #[path = "fcp-host/live_authority.rs"]
@@ -2593,6 +2595,41 @@ enum ConnectorRuntime {
     Dormant(Arc<lifecycle_runtime::DormantConnector>),
 }
 
+/// Identity of the owner whose observation was last durably reconciled.
+/// Weak references neither keep a retired child alive nor permit pointer reuse
+/// to make a new deployment inherit the old deployment's observation.
+enum RuntimeObservationOwner {
+    Native(Weak<SubprocessConnector>),
+    NativeWarmPool(Weak<NativeWarmPoolConnector>),
+    Wasi(Weak<WasiConnector>),
+    UnavailableNativeProxyOnly(Weak<UnavailableNativeProxyOnlyConnector>),
+    Dormant(Weak<lifecycle_runtime::DormantConnector>),
+}
+
+impl RuntimeObservationOwner {
+    fn matches(&self, runtime: &ConnectorRuntime) -> bool {
+        match (self, runtime) {
+            (Self::Native(previous), ConnectorRuntime::Native(current)) => {
+                previous.ptr_eq(&Arc::downgrade(current))
+            }
+            (Self::NativeWarmPool(previous), ConnectorRuntime::NativeWarmPool(current)) => {
+                previous.ptr_eq(&Arc::downgrade(current))
+            }
+            (Self::Wasi(previous), ConnectorRuntime::Wasi(current)) => {
+                previous.ptr_eq(&Arc::downgrade(current))
+            }
+            (
+                Self::UnavailableNativeProxyOnly(previous),
+                ConnectorRuntime::UnavailableNativeProxyOnly(current),
+            ) => previous.ptr_eq(&Arc::downgrade(current)),
+            (Self::Dormant(previous), ConnectorRuntime::Dormant(current)) => {
+                previous.ptr_eq(&Arc::downgrade(current))
+            }
+            _ => false,
+        }
+    }
+}
+
 impl ConnectorRuntime {
     async fn spawn(
         config: ConnectorConfig,
@@ -2701,6 +2738,62 @@ impl ConnectorRuntime {
         }
     }
 
+    /// Observe runtime ownership without sending an RPC or starting a guest.
+    ///
+    /// Static metadata defaults to Healthy before any health check, so it must
+    /// not be promoted into a Running claim. Only a dormant runtime provides
+    /// a stopped/missing observation here. An unchanged active owner preserves
+    /// its current observation; a new owner cannot inherit the prior one's health.
+    fn runtime_observation(
+        &self,
+        previous_owner: Option<&RuntimeObservationOwner>,
+    ) -> fcp_host::ConnectorRuntimeObservation {
+        use fcp_host::{ObservedRuntimeState, RuntimeStateObservation};
+
+        let mut summary = self.static_summary();
+        let observed_state = match self {
+            Self::Dormant(connector) => {
+                RuntimeStateObservation::Observed(connector.observed_state())
+            }
+            Self::UnavailableNativeProxyOnly(_) => {
+                RuntimeStateObservation::Observed(ObservedRuntimeState::Degraded)
+            }
+            _ if previous_owner.is_some_and(|previous| previous.matches(self)) => {
+                RuntimeStateObservation::PreserveExisting
+            }
+            Self::Native(_) | Self::NativeWarmPool(_) | Self::Wasi(_) => {
+                RuntimeStateObservation::Observed(ObservedRuntimeState::Unknown)
+            }
+        };
+        if matches!(
+            self,
+            Self::Native(_) | Self::NativeWarmPool(_) | Self::Wasi(_)
+        ) {
+            summary.health = ConnectorHealth::unavailable(
+                "runtime ownership is retained; health was not probed during reconciliation",
+            );
+            summary.last_health_check = None;
+        }
+        fcp_host::ConnectorRuntimeObservation {
+            summary,
+            observed_state,
+        }
+    }
+
+    fn observation_owner(&self) -> RuntimeObservationOwner {
+        match self {
+            Self::Native(connector) => RuntimeObservationOwner::Native(Arc::downgrade(connector)),
+            Self::NativeWarmPool(connector) => {
+                RuntimeObservationOwner::NativeWarmPool(Arc::downgrade(connector))
+            }
+            Self::Wasi(connector) => RuntimeObservationOwner::Wasi(Arc::downgrade(connector)),
+            Self::UnavailableNativeProxyOnly(connector) => {
+                RuntimeObservationOwner::UnavailableNativeProxyOnly(Arc::downgrade(connector))
+            }
+            Self::Dormant(connector) => RuntimeObservationOwner::Dormant(Arc::downgrade(connector)),
+        }
+    }
+
     fn static_summary(&self) -> ConnectorSummary {
         match self {
             Self::Native(connector) => connector.summary.clone(),
@@ -2728,6 +2821,9 @@ struct SubprocessRegistry {
     // Serialize managed-file, registry, and lifecycle changes together, including
     // rollback. Invocation and ordinary registry reads never take this gate.
     inventory_transaction: Arc<futures_util::lock::Mutex<()>>,
+    // Updated only after successful admin persistence. Registry clones share
+    // the bindings, but these weak references never extend process lifetime.
+    observation_owners: Arc<StdMutex<HashMap<ConnectorId, RuntimeObservationOwner>>>,
     resilience: Arc<ResilienceLayer>,
     version: Arc<AtomicU64>,
     capability_verifying_key: Option<[u8; PUBLIC_KEY_SIZE]>,
@@ -3914,12 +4010,103 @@ impl SubprocessRegistry {
         Ok(Self {
             state: Arc::new(RwLock::new(RegistryState { connectors: map })),
             inventory_transaction: Arc::new(futures_util::lock::Mutex::new(())),
+            observation_owners: Arc::default(),
             resilience,
             version: Arc::new(AtomicU64::new(1)),
             capability_verifying_key,
             rate_limiters: Arc::new(HostRateLimiterStore::default()),
             shutting_down: Arc::new(AtomicBool::new(false)),
         })
+    }
+
+    /// Reconcile the exact current runtime owners without connector execution.
+    ///
+    /// Live callers retain inventory_transaction through this method; startup
+    /// calls it before serving requests. Release the read guard before awaiting
+    /// admin persistence and recheck the captured generation inside its write
+    /// transaction, so a stale snapshot cannot publish lifecycle observations.
+    async fn reconcile_lifecycle(
+        &self,
+        lifecycle: &HostAdminStateStore,
+    ) -> Result<StartupReconciliationReport, LifecycleError> {
+        let (generation, observations, owners) = {
+            let state = self.state.read().await;
+            let generation = self.version.load(Ordering::SeqCst);
+            let previous = self
+                .observation_owners
+                .lock()
+                .expect("runtime observation owner cache lock");
+            let mut observations = Vec::with_capacity(state.connectors.len());
+            let mut owners = HashMap::with_capacity(state.connectors.len());
+            for (connector_id, entry) in &state.connectors {
+                observations.push(
+                    entry
+                        .connector
+                        .runtime_observation(previous.get(connector_id)),
+                );
+                owners.insert(connector_id.clone(), entry.connector.observation_owner());
+            }
+            (generation, observations, owners)
+        };
+        let report = lifecycle
+            .reconcile_runtime_observations_guarded(&observations, || {
+                self.require_generation(generation)
+                    .map_err(|error| LifecycleError::Persistence {
+                        reason: error.to_string(),
+                    })
+            })
+            .await?;
+        // No await separates durable observation from the identity binding.
+        // Failed persistence never teaches the cache to retain an old status.
+        *self
+            .observation_owners
+            .lock()
+            .expect("runtime observation owner cache lock") = owners;
+        Ok(report)
+    }
+
+    /// Observe only the selected runtime, preserving every unrelated admin row.
+    /// The caller retains inventory_transaction through this operation.
+    async fn reconcile_connector_lifecycle(
+        &self,
+        lifecycle: &HostAdminStateStore,
+        connector_id: &ConnectorId,
+    ) -> Result<ConnectorAdminStatus, LifecycleError> {
+        let (generation, observation, owner) = {
+            let state = self.state.read().await;
+            let generation = self.version.load(Ordering::SeqCst);
+            let entry =
+                state
+                    .connectors
+                    .get(connector_id)
+                    .ok_or_else(|| LifecycleError::NotFound {
+                        connector_id: connector_id.clone(),
+                    })?;
+            let previous = self
+                .observation_owners
+                .lock()
+                .expect("runtime observation owner cache lock");
+            (
+                generation,
+                entry
+                    .connector
+                    .runtime_observation(previous.get(connector_id)),
+                entry.connector.observation_owner(),
+            )
+        };
+        let status = lifecycle
+            .reconcile_runtime_observation_guarded(&observation, || {
+                self.require_generation(generation)
+                    .map_err(|error| LifecycleError::Persistence {
+                        reason: error.to_string(),
+                    })
+            })
+            .await?;
+        self.observation_owners
+            .lock()
+            .expect("runtime observation owner cache lock")
+            .insert(connector_id.clone(), owner);
+        Ok(status)
     }
 
     async fn inventory(&self) -> Vec<ConnectorConfig> {
@@ -10788,9 +10975,7 @@ async fn async_main(telemetry_config: TelemetryConfig) -> HostResult<()> {
         Arc::clone(&registry),
         Arc::clone(&budget),
     ));
-    let startup_inventory = registry.list().await;
-    let startup_reconciliation = lifecycle
-        .reconcile_registered_connectors(&startup_inventory)
+    let startup_reconciliation = lifecycle_readiness::full(&registry, &lifecycle)
         .await
         .map_err(map_lifecycle_host_error)?;
     log_startup_reconciliation(&startup_reconciliation);
@@ -11499,11 +11684,8 @@ async fn reload_connectors(state: &AppState, published: &AtomicBool) -> Result<u
         "registry updated from reloaded config"
     );
 
-    // Reconcile lifecycle state with the new inventory.
-    let inventory = state.registry.list().await;
-    let reconciliation = state
-        .lifecycle
-        .reconcile_registered_connectors(&inventory)
+    // Preserve runtime custody and deliberately observe admitted active readiness.
+    let reconciliation = lifecycle_readiness::full(&state.registry, &state.lifecycle)
         .await
         .map_err(|e| HostError::Internal(format!("reconciliation failed: {e}")))?;
     log_startup_reconciliation(&reconciliation);
@@ -14301,11 +14483,7 @@ async fn connector_inventory_apply_handler(
                 ))));
             }
         };
-        let admin_state = match state
-            .lifecycle
-            .reconcile_registered_connectors(&state.registry.list().await)
-            .await
-        {
+        let admin_state = match lifecycle_readiness::full(&state.registry, &state.lifecycle).await {
             Ok(report) => report,
             Err(err) => {
                 let rollback_note =
@@ -14554,11 +14732,7 @@ async fn rollback_connector_inventory(
         Ok(_) => "live registry rolled back".to_string(),
         Err(err) => format!("live registry rollback also failed: {err}"),
     };
-    let lifecycle_note = match state
-        .lifecycle
-        .reconcile_registered_connectors(&state.registry.list().await)
-        .await
-    {
+    let lifecycle_note = match lifecycle_readiness::full(&state.registry, &state.lifecycle).await {
         Ok(_) => "admin state reconciled after rollback".to_string(),
         Err(err) => format!(
             "admin-state rollback reconciliation also failed: {}",
@@ -14680,11 +14854,7 @@ async fn apply_connector_config_payload_locked(
     let current_payload = connector_config_payload(&current_entry);
     let current = SanitizedConnectorConfig::from_payload(current_payload.clone())
         .map_err(map_lifecycle_host_error)?;
-    let admin_state = match state
-        .lifecycle
-        .reconcile_registered_connectors(&state.registry.list().await)
-        .await
-    {
+    let admin_state = match lifecycle_readiness::full(&state.registry, &state.lifecycle).await {
         Ok(report) => report,
         Err(err) => {
             let rollback_note =
@@ -17377,12 +17547,14 @@ async fn perform_authorized_host_http_egress_once(
                 authorized.require_current()?;
                 // Resource authority is checked before DNS or credential use
                 // for this exact hop, including relative Location targets.
-                let hop_authority =
-                    authorize_host_egress_context(state, &request.context, &request.url, started_at)
-                        .await
-                        .map_err(|error| {
-                            redact_host_http_redirect_authorization(error, redirects)
-                        })?;
+                let hop_authority = authorize_host_egress_context(
+                    state,
+                    &request.context,
+                    &request.url,
+                    started_at,
+                )
+                .await
+                .map_err(|error| redact_host_http_redirect_authorization(error, redirects))?;
                 authorized.require_current()?;
                 let hop_lease = match lease {
                     Some(lease) if redirects > 0 => Some(
@@ -17436,12 +17608,14 @@ async fn perform_authorized_host_http_egress_once(
                 // DNS and refresh waits must not retain expired or revoked
                 // authority. Read the credential after preparation, then
                 // inject into caller headers without stale injected values.
-                let current_authority =
-                    authorize_host_egress_context(state, &request.context, &request.url, started_at)
-                        .await
-                        .map_err(|error| {
-                            redact_host_http_redirect_authorization(error, redirects)
-                        })?;
+                let current_authority = authorize_host_egress_context(
+                    state,
+                    &request.context,
+                    &request.url,
+                    started_at,
+                )
+                .await
+                .map_err(|error| redact_host_http_redirect_authorization(error, redirects))?;
                 let current_lease = match hop_lease.as_ref() {
                     Some(lease) => Some(
                         state
@@ -22386,6 +22560,7 @@ output_schema = {{ type = "object" }}
         Arc::new(SubprocessRegistry {
             state: Arc::new(RwLock::new(RegistryState { connectors })),
             inventory_transaction: Arc::new(futures_util::lock::Mutex::new(())),
+            observation_owners: Arc::default(),
             resilience: Arc::new(ResilienceLayer::default()),
             version: Arc::new(AtomicU64::new(1)),
             capability_verifying_key: None,
@@ -22416,6 +22591,7 @@ output_schema = {{ type = "object" }}
         Arc::new(SubprocessRegistry {
             state: Arc::new(RwLock::new(RegistryState { connectors })),
             inventory_transaction: Arc::new(futures_util::lock::Mutex::new(())),
+            observation_owners: Arc::default(),
             resilience: Arc::new(ResilienceLayer::default()),
             version: Arc::new(AtomicU64::new(1)),
             capability_verifying_key: None,
@@ -29320,9 +29496,10 @@ output_schema = { type = "object" }
             } else {
                 format!("tcp://{addr}")
             };
-            let admitted = authorize_host_egress_context(&state, &context, &resource, Instant::now())
-                .await
-                .expect("matching inventory and manifest admit transport");
+            let admitted =
+                authorize_host_egress_context(&state, &context, &resource, Instant::now())
+                    .await
+                    .expect("matching inventory and manifest admit transport");
             // The manifest requires a connector input object with a message.
             // Provider bytes are a different wire contract and remain opaque.
             fcp_async_core::time::timeout(
@@ -32368,10 +32545,14 @@ output_schema = { type = "object" }
                 3_000,
             )
             .await;
-            let authorized =
-                authorize_host_egress_context(&state, &request.context, &request.url, Instant::now())
-                    .await
-                    .expect("authorize refresh fixture");
+            let authorized = authorize_host_egress_context(
+                &state,
+                &request.context,
+                &request.url,
+                Instant::now(),
+            )
+            .await
+            .expect("authorize refresh fixture");
             let credential_id =
                 CredentialId::parse(request.credential_id.as_deref().unwrap()).unwrap();
             let (first_lease, second_lease) = {
@@ -34979,6 +35160,7 @@ output_schema = { type = "object" }
         let registry = Arc::new(SubprocessRegistry {
             state: Arc::new(RwLock::new(RegistryState { connectors })),
             inventory_transaction: Arc::new(futures_util::lock::Mutex::new(())),
+            observation_owners: Arc::default(),
             resilience: Arc::new(ResilienceLayer::default()),
             version: Arc::new(AtomicU64::new(1)),
             capability_verifying_key: None,
@@ -35571,6 +35753,7 @@ output_schema = { type = "object" }
         let registry = Arc::new(SubprocessRegistry {
             state: Arc::new(RwLock::new(RegistryState { connectors })),
             inventory_transaction: Arc::new(futures_util::lock::Mutex::new(())),
+            observation_owners: Arc::default(),
             resilience: Arc::new(ResilienceLayer::default()),
             version: Arc::new(AtomicU64::new(1)),
             capability_verifying_key: None,
@@ -45065,10 +45248,167 @@ done"#;
 
     // ── SubprocessRegistry version() ──
 
+    #[fcp_async_core::runtime::test]
+    async fn runtime_reconciliation_does_not_execute_connector_health_or_introspection() {
+        const CONNECTOR: &str = "fcp.test.reconcile-no-rpc:utility:1.0.0";
+        let calls = Arc::new(AtomicU64::new(0));
+        let actor_calls = Arc::clone(&calls);
+        let (sender, mut receiver) = mpsc::channel::<ConnectorRpcRequest>(4);
+        let actor = task::spawn(async move {
+            while let Some(request) = receiver.recv().await {
+                actor_calls.fetch_add(1, Ordering::SeqCst);
+                let _ = request.response_tx.send(Err(std::io::Error::other(
+                    "inventory reconciliation must not call the connector",
+                )));
+            }
+        });
+        let native = dispatcher_test_connector(CONNECTOR, sender, actor);
+        let first_owner = Arc::downgrade(&native);
+        let registry = dispatcher_registry_with_connector(
+            CONNECTOR,
+            native,
+            dispatcher_test_config(CONNECTOR),
+        );
+        let lifecycle = HostAdminStateStore::new();
+        let connector_id = ConnectorId::from_static(CONNECTOR);
+        lifecycle
+            .set_desired_state(&connector_id, fcp_host::DesiredRuntimeState::Disabled, None)
+            .await
+            .unwrap();
+        let _transaction = registry.inventory_transaction.lock().await;
+        let generation = registry.version();
+        registry.reconcile_lifecycle(&lifecycle).await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(registry.version(), generation);
+        let status = lifecycle.connector_status(&connector_id).await.unwrap();
+        assert_eq!(
+            status.desired_state,
+            fcp_host::DesiredRuntimeState::Disabled
+        );
+        assert_eq!(
+            status.observed_state,
+            fcp_host::ObservedRuntimeState::Unknown
+        );
+        assert!(
+            lifecycle
+                .connector_execution_fence(&connector_id)
+                .await
+                .is_err()
+        );
+
+        // A later genuine observation belongs to the same physical owner.
+        // Registry clones and full reconciliation must retain it without RPCs.
+        let shared = registry.as_ref().clone();
+        for observed in [
+            fcp_host::ObservedRuntimeState::Running,
+            fcp_host::ObservedRuntimeState::Degraded,
+        ] {
+            lifecycle
+                .set_observed_state(&connector_id, observed, None)
+                .await
+                .unwrap();
+            let before = lifecycle.connector_status(&connector_id).await.unwrap();
+            shared.reconcile_lifecycle(&lifecycle).await.unwrap();
+            let current = lifecycle.connector_status(&connector_id).await.unwrap();
+            assert_eq!(current.observed_state, observed);
+            assert_eq!(current.last_journal_sequence, before.last_journal_sequence);
+        }
+
+        let actor_calls = Arc::clone(&calls);
+        let (sender, mut receiver) = mpsc::channel::<ConnectorRpcRequest>(4);
+        let actor = task::spawn(async move {
+            while let Some(request) = receiver.recv().await {
+                actor_calls.fetch_add(1, Ordering::SeqCst);
+                let _ = request.response_tx.send(Err(std::io::Error::other(
+                    "replacement reconciliation must not call the connector",
+                )));
+            }
+        });
+        let replacement = dispatcher_test_connector(CONNECTOR, sender, actor);
+        {
+            let mut state = registry.state.write().await;
+            state.connectors.get_mut(&connector_id).unwrap().connector =
+                ConnectorRuntime::Native(replacement);
+            registry.version.fetch_add(1, Ordering::SeqCst);
+        }
+        assert!(
+            first_owner.upgrade().is_none(),
+            "observation identity must not retain the old process owner"
+        );
+        registry.reconcile_lifecycle(&lifecycle).await.unwrap();
+        let current = lifecycle.connector_status(&connector_id).await.unwrap();
+        assert_eq!(
+            current.observed_state,
+            fcp_host::ObservedRuntimeState::Unknown
+        );
+        assert_eq!(
+            current.desired_state,
+            fcp_host::DesiredRuntimeState::Disabled
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn runtime_reconciliation_distinguishes_retained_disabled_and_uninstalled_entries() {
+        for (desired, observed) in [
+            (
+                fcp_host::DesiredRuntimeState::Disabled,
+                fcp_host::ObservedRuntimeState::Stopped,
+            ),
+            (
+                fcp_host::DesiredRuntimeState::Uninstalled,
+                fcp_host::ObservedRuntimeState::Missing,
+            ),
+        ] {
+            let registry = empty_registry(1);
+            let lifecycle = HostAdminStateStore::new();
+            let mut config = dispatcher_test_config("fcp.test.reconcile-dormant:utility:1.0.0");
+            config.binary = "/must-not-execute-during-reconciliation".to_owned();
+            let connector_id: ConnectorId = config.id.parse().unwrap();
+            lifecycle
+                .set_desired_state(&connector_id, desired, None)
+                .await
+                .unwrap();
+            let entry = lifecycle_runtime::dormant_entry(
+                config,
+                ValidatedConnectorConfig {
+                    manifest_constraints: ManifestOperationConstraintCatalog::default(),
+                    state_policy: ConnectorStatePolicy::default(),
+                    native_executable: None,
+                    wasi_component: None,
+                },
+                desired,
+            )
+            .unwrap();
+            registry
+                .state
+                .write()
+                .await
+                .connectors
+                .insert(connector_id.clone(), entry);
+            let _transaction = registry.inventory_transaction.lock().await;
+            for _ in 0..2 {
+                let report = registry.reconcile_lifecycle(&lifecycle).await.unwrap();
+                assert_eq!(report.drifted_connectors, 0);
+                let status = lifecycle.connector_status(&connector_id).await.unwrap();
+                assert_eq!(status.desired_state, desired);
+                assert_eq!(status.observed_state, observed);
+                assert!(
+                    lifecycle
+                        .connector_execution_fence(&connector_id)
+                        .await
+                        .is_err()
+                );
+            }
+            assert_eq!(registry.version(), 1);
+        }
+    }
+
     fn empty_registry(version: u64) -> SubprocessRegistry {
         SubprocessRegistry {
             state: Arc::new(RwLock::new(RegistryState::default())),
             inventory_transaction: Arc::new(futures_util::lock::Mutex::new(())),
+            observation_owners: Arc::default(),
             resilience: Arc::new(ResilienceLayer::default()),
             version: Arc::new(AtomicU64::new(version)),
             capability_verifying_key: None,

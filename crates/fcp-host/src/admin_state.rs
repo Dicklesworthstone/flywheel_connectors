@@ -3365,6 +3365,34 @@ pub struct ConnectorAdminState {
 }
 
 impl ConnectorAdminState {
+    /// Preserve unresolved physical custody when observing a dormant inventory.
+    ///
+    /// A host restart can reconstruct configuration without retaining the old
+    /// child handle. That absence cannot prove that an interrupted source or
+    /// replacement exited; only committed checkpoint and exit evidence can.
+    #[must_use]
+    pub fn constrain_runtime_observation(
+        &self,
+        observed: ObservedRuntimeState,
+    ) -> ObservedRuntimeState {
+        if matches!(
+            observed,
+            ObservedRuntimeState::Stopped | ObservedRuntimeState::Missing
+        ) && self
+            .telegram_polling_restart
+            .as_ref()
+            .is_some_and(|custody| {
+                custody.checkpoint.is_none()
+                    || !custody.source_exited
+                    || custody.candidate_may_exist
+            })
+        {
+            ObservedRuntimeState::Unknown
+        } else {
+            observed
+        }
+    }
+
     /// Return the active config revision, if any.
     #[must_use]
     pub fn active_config_revision(&self) -> Option<&ConfigRevisionRecord> {
@@ -3504,6 +3532,30 @@ pub struct StartupReconciliationEntry {
     pub drift: Option<ConnectorDriftStatus>,
 }
 
+/// Whether an exact runtime owner has new evidence to publish.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeStateObservation {
+    /// A new observation of this exact runtime owner.
+    Observed(ObservedRuntimeState),
+    /// Retain the current observation of an unchanged runtime owner.
+    ///
+    /// The caller must prove physical owner identity, not just connector id or
+    /// configuration equality. The existing state is read inside the mutation.
+    PreserveExisting,
+}
+
+/// A host-owned observation captured from one exact runtime inventory generation.
+///
+/// This is intentionally not a wire payload. A disabled configuration or an
+/// unavailable health RPC alone is not proof that a process or guest has exited.
+#[derive(Debug, Clone)]
+pub struct ConnectorRuntimeObservation {
+    /// Inventory metadata captured with the runtime ownership observation.
+    pub summary: ConnectorSummary,
+    /// New evidence, or preservation of an unchanged owner's current evidence.
+    pub observed_state: RuntimeStateObservation,
+}
+
 /// Aggregate startup reconciliation report.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StartupReconciliationReport {
@@ -3537,7 +3589,8 @@ const fn observed_state_from_summary(summary: &ConnectorSummary) -> ObservedRunt
     match &summary.health {
         ConnectorHealth::Healthy => ObservedRuntimeState::Running,
         ConnectorHealth::Degraded { .. } => ObservedRuntimeState::Degraded,
-        ConnectorHealth::Unavailable { .. } => ObservedRuntimeState::Stopped,
+        // Failure to answer a health request does not prove physical exit.
+        ConnectorHealth::Unavailable { .. } => ObservedRuntimeState::Degraded,
     }
 }
 
@@ -3945,6 +3998,12 @@ fn set_snapshot_observed_state(
     observed_state: ObservedRuntimeState,
     initiated_by: Option<&str>,
 ) -> bool {
+    let observed_state = snapshot
+        .connectors
+        .get(connector_id)
+        .map_or(observed_state, |state| {
+            state.constrain_runtime_observation(observed_state)
+        });
     let current = snapshot
         .connectors
         .get(connector_id)
@@ -3967,6 +4026,7 @@ fn set_snapshot_observed_state(
 fn reconcile_registered_connector(
     snapshot: &mut HostAdminStateSnapshot,
     summary: &ConnectorSummary,
+    observation: RuntimeStateObservation,
     now: DateTime<Utc>,
 ) -> (StartupReconciliationEntry, bool) {
     let connector_id = &summary.id;
@@ -3995,10 +4055,14 @@ fn reconcile_registered_connector(
         );
     }
 
+    let observed_state = match observation {
+        RuntimeStateObservation::Observed(observed) => observed,
+        RuntimeStateObservation::PreserveExisting => observed_state_before,
+    };
     let observed_updated = set_snapshot_observed_state(
         snapshot,
         connector_id,
-        observed_state_from_summary(summary),
+        observed_state,
         Some(STARTUP_RECONCILIATION_ACTOR),
     );
     updated |= observed_updated;
@@ -4736,6 +4800,12 @@ impl HostAdminStateStore {
         initiated_by: Option<String>,
     ) -> Result<(), LifecycleError> {
         self.apply_mutation(|snapshot| {
+            let observed_state = snapshot
+                .connectors
+                .get(connector_id)
+                .map_or(observed_state, |state| {
+                    state.constrain_runtime_observation(observed_state)
+                });
             let sequence = snapshot.append_journal(
                 connector_id,
                 AdminStateMutation::ObservedStateSet { observed_state },
@@ -6784,6 +6854,9 @@ impl HostAdminStateStore {
     /// initializes intent for newly discovered connectors and refreshes observed
     /// runtime state so crashes, missing artifacts, and stuck rollouts surface as
     /// explicit drift instead of stale snapshots.
+    /// A disabled summary must describe a runtime already confirmed stopped.
+    /// Configuration-only inventories should use
+    /// [`Self::reconcile_runtime_observations_guarded`] with explicit custody evidence.
     ///
     /// # Errors
     ///
@@ -6801,11 +6874,98 @@ impl HostAdminStateStore {
         registered: &[ConnectorSummary],
         now: DateTime<Utc>,
     ) -> Result<StartupReconciliationReport, LifecycleError> {
+        let observations = registered
+            .iter()
+            .map(|summary| ConnectorRuntimeObservation {
+                summary: summary.clone(),
+                observed_state: RuntimeStateObservation::Observed(observed_state_from_summary(
+                    summary,
+                )),
+            })
+            .collect::<Vec<_>>();
+        self.reconcile_runtime_observations_at(&observations, now, || Ok(()))
+            .await
+    }
+
+    /// Reconcile exact local runtime observations without executing health RPCs.
+    ///
+    /// The caller must retain the inventory transaction through this operation.
+    /// The guard revalidates its captured generation after acquiring the admin
+    /// write lock, immediately before the synchronous persistence transaction.
+    /// Existing desired lifecycle authority is never replaced by observations.
+    ///
+    /// # Errors
+    ///
+    /// Refuses stale inventory, duplicate connector observations, or failed
+    /// durable persistence without publishing a partial reconciliation.
+    pub async fn reconcile_runtime_observations_guarded<F>(
+        &self,
+        registered: &[ConnectorRuntimeObservation],
+        validate: F,
+    ) -> Result<StartupReconciliationReport, LifecycleError>
+    where
+        F: FnOnce() -> Result<(), LifecycleError>,
+    {
+        self.reconcile_runtime_observations_at(registered, Utc::now(), validate)
+            .await
+    }
+
+    /// Reconcile one exact runtime owner without changing other connector rows.
+    ///
+    /// The caller retains the inventory transaction and validates the captured
+    /// owner generation. Preservation and custody normalization both happen
+    /// under the admin write lock, and the returned status describes that commit.
+    ///
+    /// # Errors
+    ///
+    /// Refuses stale inventory or failed durable persistence.
+    pub async fn reconcile_runtime_observation_guarded<F>(
+        &self,
+        observation: &ConnectorRuntimeObservation,
+        validate: F,
+    ) -> Result<ConnectorAdminStatus, LifecycleError>
+    where
+        F: FnOnce() -> Result<(), LifecycleError>,
+    {
+        let now = Utc::now();
         self.apply_mutation(|snapshot| {
+            validate()?;
+            let _ = reconcile_registered_connector(
+                snapshot,
+                &observation.summary,
+                observation.observed_state,
+                now,
+            );
+            let connector_id = &observation.summary.id;
+            let state = snapshot
+                .connectors
+                .get(connector_id)
+                .expect("reconciled connector state must exist");
+            Ok(connector_admin_status_from_state(connector_id, state, now))
+        })
+        .await
+    }
+
+    async fn reconcile_runtime_observations_at<F>(
+        &self,
+        registered: &[ConnectorRuntimeObservation],
+        now: DateTime<Utc>,
+        validate: F,
+    ) -> Result<StartupReconciliationReport, LifecycleError>
+    where
+        F: FnOnce() -> Result<(), LifecycleError>,
+    {
+        self.apply_mutation(|snapshot| {
+            validate()?;
             let registered_ids: HashSet<ConnectorId> = registered
                 .iter()
-                .map(|summary| summary.id.clone())
+                .map(|observation| observation.summary.id.clone())
                 .collect();
+            if registered_ids.len() != registered.len() {
+                return Err(invocation_state_error(
+                    "runtime reconciliation contains duplicate connector identities",
+                ));
+            }
             let missing_connector_ids: Vec<ConnectorId> = snapshot
                 .connectors
                 .keys()
@@ -6817,9 +6977,13 @@ impl HostAdminStateStore {
             let mut observed_updates = 0;
             let mut entries = Vec::with_capacity(registered.len() + missing_connector_ids.len());
 
-            for summary in registered {
-                let (entry, observed_state_changed) =
-                    reconcile_registered_connector(snapshot, summary, now);
+            for observation in registered {
+                let (entry, observed_state_changed) = reconcile_registered_connector(
+                    snapshot,
+                    &observation.summary,
+                    observation.observed_state,
+                    now,
+                );
                 if entry.created_admin_state {
                     created_connectors += 1;
                 }
@@ -9850,6 +10014,219 @@ mod tests {
         assert_eq!(restored.observed_state, ObservedRuntimeState::Running);
         assert_eq!(restored.pinned_version, Some(version));
         assert!(store.journal(Some(&connector_id)).await.is_empty());
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn runtime_reconciliation_rejects_stale_and_duplicate_inventory_atomically() {
+        let store = HostAdminStateStore::new();
+        let connector = connector_id();
+        let other = secondary_connector_id();
+        for id in [&connector, &other] {
+            store
+                .set_desired_state(id, DesiredRuntimeState::Enabled, None)
+                .await
+                .unwrap();
+            store
+                .set_observed_state(id, ObservedRuntimeState::Running, None)
+                .await
+                .unwrap();
+        }
+        let before = store.connector_status(&connector).await.unwrap();
+        let other_before = store.connector_status(&other).await.unwrap();
+        let observation = ConnectorRuntimeObservation {
+            summary: connector_summary(connector.clone(), false, ConnectorHealth::healthy()),
+            observed_state: RuntimeStateObservation::Observed(ObservedRuntimeState::Missing),
+        };
+        let stale = store
+            .reconcile_runtime_observations_guarded(std::slice::from_ref(&observation), || {
+                Err(invocation_state_error("inventory generation changed"))
+            })
+            .await;
+        assert!(stale.is_err());
+        let duplicate = store
+            .reconcile_runtime_observations_guarded(&[observation.clone(), observation], || Ok(()))
+            .await;
+        assert!(duplicate.is_err());
+        for (id, prior) in [(&connector, before), (&other, other_before)] {
+            let current = store.connector_status(id).await.unwrap();
+            assert_eq!(current.last_journal_sequence, prior.last_journal_sequence);
+            assert_eq!(current.desired_state, DesiredRuntimeState::Enabled);
+            assert_eq!(current.observed_state, ObservedRuntimeState::Running);
+        }
+    }
+
+    #[cfg(unix)]
+    #[fcp_async_core::runtime::test]
+    async fn runtime_reconciliation_preserves_uninstalled_dormancy_across_reopen() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("admin.json");
+        let connector = connector_id();
+        let store = HostAdminStateStore::with_state_path(path.clone()).unwrap();
+        store
+            .set_desired_state(&connector, DesiredRuntimeState::Uninstalled, None)
+            .await
+            .unwrap();
+        let observation = ConnectorRuntimeObservation {
+            summary: connector_summary(
+                connector.clone(),
+                false,
+                ConnectorHealth::unavailable("retained dormant configuration"),
+            ),
+            observed_state: RuntimeStateObservation::Observed(ObservedRuntimeState::Missing),
+        };
+        for _ in 0..2 {
+            let report = store
+                .reconcile_runtime_observations_guarded(std::slice::from_ref(&observation), || {
+                    Ok(())
+                })
+                .await
+                .unwrap();
+            assert_eq!(report.drifted_connectors, 0);
+            let status = store.connector_status(&connector).await.unwrap();
+            assert_eq!(status.desired_state, DesiredRuntimeState::Uninstalled);
+            assert_eq!(status.observed_state, ObservedRuntimeState::Missing);
+            assert!(store.connector_execution_fence(&connector).await.is_err());
+        }
+        drop(store);
+        let reopened = HostAdminStateStore::with_state_path(path).unwrap();
+        let status = reopened.connector_status(&connector).await.unwrap();
+        assert_eq!(status.desired_state, DesiredRuntimeState::Uninstalled);
+        assert_eq!(status.observed_state, ObservedRuntimeState::Missing);
+        assert!(status.drift.is_none());
+        assert!(
+            reopened
+                .connector_execution_fence(&connector)
+                .await
+                .is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[fcp_async_core::runtime::test]
+    async fn runtime_reconciliation_preserves_unresolved_telegram_custody() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("admin.json");
+        let connector = ConnectorId::from_static("fcp.telegram");
+        let store = HostAdminStateStore::with_state_path(path.clone()).unwrap();
+        store
+            .set_desired_state(&connector, DesiredRuntimeState::Enabled, None)
+            .await
+            .unwrap();
+        let preparation = store
+            .prepare_telegram_polling_restart(&connector)
+            .await
+            .unwrap();
+        let custody = store
+            .begin_telegram_polling_restart(
+                &connector,
+                &preparation,
+                TelegramPollingRestartBinding {
+                    config_digest: "11".repeat(32),
+                    manifest_digest: "22".repeat(32),
+                    binary_sha256: "33".repeat(32),
+                    zone_id: "z:work".to_owned(),
+                    bot_id: "123456".to_owned(),
+                    state_root: "/fixture/telegram-state".to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(custody.checkpoint.is_none());
+        assert!(!custody.source_exited);
+        store
+            .set_desired_state(&connector, DesiredRuntimeState::Uninstalled, None)
+            .await
+            .unwrap();
+        let retained = store
+            .connector_state(&connector)
+            .await
+            .unwrap()
+            .telegram_polling_restart;
+        for observed_state in [ObservedRuntimeState::Stopped, ObservedRuntimeState::Missing] {
+            let observation = ConnectorRuntimeObservation {
+                summary: connector_summary(
+                    connector.clone(),
+                    false,
+                    ConnectorHealth::unavailable("source ownership interrupted by restart"),
+                ),
+                observed_state: RuntimeStateObservation::Observed(observed_state),
+            };
+            store
+                .reconcile_runtime_observations_guarded(&[observation], || Ok(()))
+                .await
+                .unwrap();
+            assert_eq!(
+                store
+                    .connector_status(&connector)
+                    .await
+                    .unwrap()
+                    .observed_state,
+                ObservedRuntimeState::Unknown,
+            );
+            store
+                .set_observed_state(&connector, observed_state, None)
+                .await
+                .unwrap();
+            assert_eq!(
+                store
+                    .connector_status(&connector)
+                    .await
+                    .unwrap()
+                    .observed_state,
+                ObservedRuntimeState::Unknown,
+            );
+        }
+        store
+            .reconcile_runtime_observations_guarded(&[], || Ok(()))
+            .await
+            .unwrap();
+        drop(store);
+        let reopened = HostAdminStateStore::with_state_path(path).unwrap();
+        let state = reopened.connector_state(&connector).await.unwrap();
+        assert_eq!(state.desired_state, DesiredRuntimeState::Uninstalled);
+        assert_eq!(state.observed_state, ObservedRuntimeState::Unknown);
+        assert_eq!(state.telegram_polling_restart, retained);
+        assert!(
+            reopened
+                .connector_execution_fence(&connector)
+                .await
+                .is_err()
+        );
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn runtime_reconciliation_unknown_health_never_invents_a_stop_or_authority() {
+        let store = HostAdminStateStore::new();
+        let connector = connector_id();
+        store
+            .set_desired_state(&connector, DesiredRuntimeState::Disabled, None)
+            .await
+            .unwrap();
+        let observation = ConnectorRuntimeObservation {
+            summary: connector_summary(connector.clone(), true, ConnectorHealth::healthy()),
+            observed_state: RuntimeStateObservation::Observed(ObservedRuntimeState::Unknown),
+        };
+        store
+            .reconcile_runtime_observations_guarded(&[observation], || Ok(()))
+            .await
+            .unwrap();
+        let status = store.connector_status(&connector).await.unwrap();
+        assert_eq!(status.desired_state, DesiredRuntimeState::Disabled);
+        assert_eq!(status.observed_state, ObservedRuntimeState::Unknown);
+        assert!(store.connector_execution_fence(&connector).await.is_err());
+
+        store
+            .reconcile_registered_connectors(&[connector_summary(
+                connector.clone(),
+                true,
+                ConnectorHealth::unavailable("health socket timed out"),
+            )])
+            .await
+            .unwrap();
+        let status = store.connector_status(&connector).await.unwrap();
+        assert_eq!(status.desired_state, DesiredRuntimeState::Disabled);
+        assert_eq!(status.observed_state, ObservedRuntimeState::Degraded);
+        assert!(store.connector_execution_fence(&connector).await.is_err());
     }
 
     #[fcp_async_core::runtime::test]
@@ -15170,18 +15547,18 @@ mod tests {
     }
 
     #[test]
-    fn observed_state_from_summary_enabled_unavailable_is_stopped() {
+    fn observed_state_from_summary_unavailable_health_is_not_exit_evidence() {
         let summary = connector_summary(
             connector_id(),
             true,
             ConnectorHealth::Unavailable {
-                reason: "crashed".to_string(),
+                reason: "health transport failed".to_string(),
                 since: Utc::now(),
             },
         );
         assert_eq!(
             observed_state_from_summary(&summary),
-            ObservedRuntimeState::Stopped
+            ObservedRuntimeState::Degraded
         );
     }
 
