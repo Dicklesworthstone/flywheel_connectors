@@ -769,6 +769,7 @@ mod tests {
             previous_desired_state: DesiredRuntimeState::Disabled,
             pending: Some(TelegramPollingRestartCustody {
                 custody_id: 1,
+                desired_state: DesiredRuntimeState::Disabled,
                 binding: binding.clone(),
                 checkpoint: Some(checkpoint(Some(1001))),
                 source_exited: true,
