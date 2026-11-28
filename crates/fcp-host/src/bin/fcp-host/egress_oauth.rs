@@ -135,7 +135,7 @@ pub(super) async fn prepare(
         let _refresh = gate.lock().await;
         // Recheck authority after waiting for another request's refresh.
         let fresh_authority =
-            authorize_host_egress_context(state, &request.context, &request.url).await?;
+            authorize_host_egress_context(state, &request.context, &request.url, started_at).await?;
         // Authorization can yield. Never send refresh material captured before
         // that wait: an administrator may have replaced or disabled it.
         let current = state

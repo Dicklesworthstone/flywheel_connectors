@@ -16763,26 +16763,55 @@ fn parse_host_egress_context(
     Ok((connector_id, operation, zone_id))
 }
 
+// Inventory must be readable before its configured egress deadline is known.
+// This ceiling bounds that first lock wait without restarting the request clock.
+const HOST_EGRESS_POLICY_READ_TIMEOUT: Duration = Duration::from_secs(5);
+
+fn host_egress_authorization_timeout() -> HostError {
+    HostError::PreflightFailed(
+        "host-egress request deadline exhausted during authorization".to_owned(),
+    )
+}
+
+fn host_egress_authorization_budget(started_at: Instant, limit: Duration) -> HostResult<Duration> {
+    limit
+        .checked_sub(started_at.elapsed())
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or_else(host_egress_authorization_timeout)
+}
+
 async fn authorize_host_egress_context(
     state: &AppState,
     context: &HostEgressContext,
     resource_uri: &str,
+    started_at: Instant,
 ) -> HostResult<AuthorizedHostEgress> {
     let (connector_id, operation, zone_id) = parse_host_egress_context(context)?;
-    let execution_fence = state
-        .lifecycle
-        .connector_execution_fence(&connector_id)
-        .await?;
     let capability_fence = state.lifecycle.capability_revocation_fence();
     let inventory_fence = state
         .registry
         .inventory_fence(state.registry.version.load(Ordering::SeqCst));
-    let snapshot = state
-        .registry
-        .runtime_network_policy_snapshot(&connector_id, &operation)
+    let policy_started_at = Instant::now();
+    let (execution_fence, snapshot) =
+        fcp_async_core::time::timeout(HOST_EGRESS_POLICY_READ_TIMEOUT, async {
+            // Capture lifecycle authority before waiting for inventory. A
+            // disable/re-enable cycle must fence this already waiting request.
+            let execution_fence = state
+                .lifecycle
+                .connector_execution_fence(&connector_id)
+                .await?;
+            let snapshot = state
+                .registry
+                .runtime_network_policy_snapshot(&connector_id, &operation)
+                .await
+                .ok_or_else(|| HostError::ConnectorNotFound(connector_id.to_string()))?;
+            Ok::<_, HostError>((execution_fence, snapshot))
+        })
         .await
-        .ok_or_else(|| HostError::ConnectorNotFound(connector_id.to_string()))?;
+        .map_err(|_| host_egress_authorization_timeout())??;
+    host_egress_authorization_budget(policy_started_at, HOST_EGRESS_POLICY_READ_TIMEOUT)?;
     inventory_fence.require_current()?;
+    execution_fence.require_current()?;
     // A signed capability is necessary but cannot override the operator's
     // inventory. Refuse scope before introspection, credential selection or DNS.
     enforce_connector_scope(&snapshot.governance, &connector_id, &operation, &zone_id)?;
@@ -16807,98 +16836,111 @@ async fn authorize_host_egress_context(
             ))
         })?;
 
-    let capability_token = capability_token_from_cbor_b64(
-        &context.capability_token_cbor_b64,
-        "host-egress capability_token_cbor_b64",
-    )?;
-    let introspection = state.discovery.introspect(&connector_id).await?;
-    let tool = admitted_operation_tool(
-        Some(&snapshot.governance),
-        &connector_id,
-        operation.as_str(),
-        &introspection.tools,
-    )?;
-    let capability_key = state.capability_verifying_key.as_ref().ok_or_else(|| {
-        HostError::PreflightFailed(
-            "FCP_HOST_CAPABILITY_PUBLIC_KEY[_FILE] is not configured, so host-egress auth checks cannot be verified"
-                .to_string(),
-        )
-    })?;
-    let verifier =
-        CapabilityVerifier::without_instance_binding(capability_key.to_bytes(), zone_id.clone());
-    let verified_token = verifier
-        .verify_unbound(
-            capability_token.clone(),
-            &tool.capability,
-            &operation,
-            &[resource_uri.to_string()],
-        )
-        .map_err(|error| {
-            HostError::PreflightFailed(format!("host-egress capability token rejected: {error}"))
-        })?;
-    let verified_claims = verified_token.claims();
-    verify_live_revocation_cascade(state, &zone_id, &capability_token, verified_claims)?;
-    if let Some(expected_holder) = verified_claims.get_holder_node() {
-        return Err(HostError::PreflightFailed(format!(
-            "host-egress capability token is holder-bound to `{expected_holder}`, but host-egress requests do not carry holder_proof"
-        )));
-    }
-    let persisted_verify = state
-        .lifecycle
-        .verify_capability_token(&CapabilityTokenVerifyRequest {
-            token_cbor_b64: capability_token_b64(&capability_token)?,
-            operation_id: Some(operation.to_string()),
-            connector_id: Some(connector_id.to_string()),
-        })
-        .await
-        .map_err(|error| {
-            HostError::PreflightFailed(format!(
-                "persisted host-egress capability verification failed: {error}"
-            ))
-        })?;
-    if !persisted_verify.valid
-        && let Some(reason) = authoritative_persisted_capability_rejection_reason(
-            &persisted_verify,
-            "persisted capability verification rejected the host-egress request",
-        )
-    {
-        return Err(HostError::PreflightFailed(format!(
-            "host-egress capability token rejected by host state: {reason}"
-        )));
-    }
+    let limit = Duration::from_millis(u64::from(constraints.total_timeout_ms));
+    let authorized = fcp_async_core::time::timeout(
+        host_egress_authorization_budget(started_at, limit)?,
+        async {
+            let capability_token = capability_token_from_cbor_b64(
+                &context.capability_token_cbor_b64,
+                "host-egress capability_token_cbor_b64",
+            )?;
+            let introspection = state.discovery.introspect(&connector_id).await?;
+            let tool = admitted_operation_tool(
+                Some(&snapshot.governance),
+                &connector_id,
+                operation.as_str(),
+                &introspection.tools,
+            )?;
+            let capability_key = state.capability_verifying_key.as_ref().ok_or_else(|| {
+                HostError::PreflightFailed(
+                    "FCP_HOST_CAPABILITY_PUBLIC_KEY[_FILE] is not configured, so host-egress auth checks cannot be verified"
+                        .to_string(),
+                )
+            })?;
+            let verifier = CapabilityVerifier::without_instance_binding(
+                capability_key.to_bytes(),
+                zone_id.clone(),
+            );
+            let verified_token = verifier
+                .verify_unbound(
+                    capability_token.clone(),
+                    &tool.capability,
+                    &operation,
+                    &[resource_uri.to_string()],
+                )
+                .map_err(|error| {
+                    HostError::PreflightFailed(format!("host-egress capability token rejected: {error}"))
+                })?;
+            let verified_claims = verified_token.claims();
+            verify_live_revocation_cascade(state, &zone_id, &capability_token, verified_claims)?;
+            if let Some(expected_holder) = verified_claims.get_holder_node() {
+                return Err(HostError::PreflightFailed(format!(
+                    "host-egress capability token is holder-bound to `{expected_holder}`, but host-egress requests do not carry holder_proof"
+                )));
+            }
+            let persisted_verify = state
+                .lifecycle
+                .verify_capability_token(&CapabilityTokenVerifyRequest {
+                    token_cbor_b64: capability_token_b64(&capability_token)?,
+                    operation_id: Some(operation.to_string()),
+                    connector_id: Some(connector_id.to_string()),
+                })
+                .await
+                .map_err(|error| {
+                    HostError::PreflightFailed(format!(
+                        "persisted host-egress capability verification failed: {error}"
+                    ))
+                })?;
+            if !persisted_verify.valid
+                && let Some(reason) = authoritative_persisted_capability_rejection_reason(
+                    &persisted_verify,
+                    "persisted capability verification rejected the host-egress request",
+                )
+            {
+                return Err(HostError::PreflightFailed(format!(
+                    "host-egress capability token rejected by host state: {reason}"
+                )));
+            }
 
-    let capability_constraints = capability_constraints_from_claims(verified_claims)?;
-    let credential_allow = capability_constraints
-        .credential_allow
-        .iter()
-        .map(ToString::to_string)
-        .collect::<Vec<_>>();
+            let capability_constraints = capability_constraints_from_claims(verified_claims)?;
+            let credential_allow = capability_constraints
+                .credential_allow
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>();
 
-    inventory_fence.require_current()?;
-    execution_fence.require_current()?;
-    capability_fence.require_current()?;
-    let capability_expires_at = verified_claims.get_expiration().ok_or_else(|| {
-        HostError::PreflightFailed("host-egress capability has no expiration".to_owned())
-    })?;
-    let capability_token_id = revocation_cascade_token_id(&capability_token, verified_claims)?;
-    let capability_issuer = revocation_cascade_issuer_kid(&capability_token)?;
-    Ok(AuthorizedHostEgress {
-        connector_id,
-        operation,
-        zone_id,
-        request_id: context.request_id.clone(),
-        correlation_id: context.correlation_id.clone(),
-        constraints,
-        credential_allow,
-        inventory_fence,
-        execution_fence,
-        capability_fence,
-        capability_expires_at,
-        capability_token_id,
-        capability_issuer,
-        revocation_cascade: Arc::clone(&state.revocation_cascade),
-        runtime_revocation: state.runtime_revocation.clone(),
-    })
+            inventory_fence.require_current()?;
+            execution_fence.require_current()?;
+            capability_fence.require_current()?;
+            let capability_expires_at = verified_claims.get_expiration().ok_or_else(|| {
+                HostError::PreflightFailed("host-egress capability has no expiration".to_owned())
+            })?;
+            let capability_token_id = revocation_cascade_token_id(&capability_token, verified_claims)?;
+            let capability_issuer = revocation_cascade_issuer_kid(&capability_token)?;
+            Ok(AuthorizedHostEgress {
+                connector_id,
+                operation,
+                zone_id,
+                request_id: context.request_id.clone(),
+                correlation_id: context.correlation_id.clone(),
+                constraints,
+                credential_allow,
+                inventory_fence,
+                execution_fence,
+                capability_fence,
+                capability_expires_at,
+                capability_token_id,
+                capability_issuer,
+                revocation_cascade: Arc::clone(&state.revocation_cascade),
+                runtime_revocation: state.runtime_revocation.clone(),
+            })
+        },
+    )
+    .await
+    .map_err(|_| host_egress_authorization_timeout())??;
+    // Timer races must not publish a late ready result as fresh authority.
+    host_egress_authorization_budget(started_at, limit)?;
+    Ok(authorized)
 }
 
 fn capability_allows_credential(credential_id: &str, credential_allow: &[String]) -> bool {
@@ -17228,9 +17270,10 @@ async fn host_egress_http_handler(
     Json(request): Json<HostEgressHttpRequest>,
 ) -> Result<Json<HostEgressHttpResponse>, (StatusCode, String)> {
     let started_at = Instant::now();
-    let authorized = authorize_host_egress_context(&state, &request.context, &request.url)
-        .await
-        .map_err(map_host_error)?;
+    let authorized =
+        authorize_host_egress_context(&state, &request.context, &request.url, started_at)
+            .await
+            .map_err(map_host_error)?;
     let lease = fcp_async_core::time::timeout(
         egress_oauth::remaining_budget(&authorized, started_at).map_err(map_host_error)?,
         acquire_host_egress_credential_lease(
@@ -17255,7 +17298,11 @@ async fn host_egress_http_handler(
         started_at,
     )
     .await;
-    result.map(Json).map_err(map_host_error)
+    let response = result.map_err(map_host_error)?;
+    authorized
+        .remaining_budget(started_at, "HTTP")
+        .map_err(map_host_error)?;
+    Ok(Json(response))
 }
 
 async fn authorize_and_perform_host_http_egress(
@@ -17331,7 +17378,7 @@ async fn perform_authorized_host_http_egress_once(
                 // Resource authority is checked before DNS or credential use
                 // for this exact hop, including relative Location targets.
                 let hop_authority =
-                    authorize_host_egress_context(state, &request.context, &request.url)
+                    authorize_host_egress_context(state, &request.context, &request.url, started_at)
                         .await
                         .map_err(|error| {
                             redact_host_http_redirect_authorization(error, redirects)
@@ -17390,7 +17437,7 @@ async fn perform_authorized_host_http_egress_once(
                 // authority. Read the credential after preparation, then
                 // inject into caller headers without stale injected values.
                 let current_authority =
-                    authorize_host_egress_context(state, &request.context, &request.url)
+                    authorize_host_egress_context(state, &request.context, &request.url, started_at)
                         .await
                         .map_err(|error| {
                             redact_host_http_redirect_authorization(error, redirects)
@@ -18170,9 +18217,10 @@ async fn host_egress_tcp_handler(
 ) -> Result<Json<HostEgressTcpResponse>, (StatusCode, String)> {
     let started_at = Instant::now();
     let resource_uri = format!("tcp://{}:{}", request.host, request.port);
-    let authorized = authorize_host_egress_context(&state, &request.context, &resource_uri)
-        .await
-        .map_err(map_host_error)?;
+    let authorized =
+        authorize_host_egress_context(&state, &request.context, &resource_uri, started_at)
+            .await
+            .map_err(map_host_error)?;
     let lease = fcp_async_core::time::timeout(
         authorized
             .remaining_budget(started_at, "TCP")
@@ -18199,7 +18247,11 @@ async fn host_egress_tcp_handler(
         started_at,
     )
     .await;
-    result.map(Json).map_err(map_host_error)
+    let response = result.map_err(map_host_error)?;
+    authorized
+        .remaining_budget(started_at, "TCP")
+        .map_err(map_host_error)?;
+    Ok(Json(response))
 }
 
 async fn authorize_and_perform_host_tcp_egress(
@@ -28755,6 +28807,257 @@ output_schema = { type = "object" }
     }
 
     #[fcp_async_core::runtime::test(flavor = "multi_thread")]
+    async fn host_egress_admission_bounds_stalled_introspection_before_credentials_or_provider_io()
+    {
+        for protocol in ["http", "tcp"] {
+            let listener = StdTcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let addr = listener.local_addr().unwrap();
+            let introspections = Arc::new(AtomicU64::new(0));
+            let observed = Arc::clone(&introspections);
+            let (release, resumed) = oneshot::channel();
+            let mut resumed = Some(resumed);
+            let (runner_tx, mut runner_rx) = mpsc::channel::<ConnectorRpcRequest>(4);
+            let runner_task = task::spawn(async move {
+                while let Some(request) = runner_rx.recv().await {
+                    if request.method == "introspect" {
+                        observed.fetch_add(1, Ordering::SeqCst);
+                        if let Some(resumed) = resumed.take() {
+                            let _ = resumed.await;
+                        }
+                        let _ = request.response_tx.send(Ok(json!({
+                            "result": dispatcher_introspection(
+                                EGRESS_GOVERNANCE_OPERATION,
+                                "cap.test.egress",
+                                SafetyTier::Safe,
+                            ),
+                        })));
+                    } else {
+                        let _ = request.response_tx.send(Ok(json!({
+                            "result": dispatcher_health_result(),
+                        })));
+                    }
+                }
+            });
+            let mut constraints = d9us6_loopback_constraints(addr.port());
+            constraints.connect_timeout_ms = 20;
+            constraints.total_timeout_ms = 75;
+            let mut config = dispatcher_test_config(EGRESS_GOVERNANCE_CONNECTOR);
+            config.runtime_network_enforcement = RuntimeNetworkEnforcement::HostEgressProxy;
+            config
+                .operation_network_constraints
+                .insert(EGRESS_GOVERNANCE_OPERATION.to_owned(), constraints);
+            let registry = dispatcher_registry_with_connector(
+                EGRESS_GOVERNANCE_CONNECTOR,
+                dispatcher_test_connector(EGRESS_GOVERNANCE_CONNECTOR, runner_tx, runner_task),
+                config,
+            );
+            let credential_id =
+                CredentialId::parse("0face000-3333-4333-8333-333333333333").unwrap();
+            let (state, signing_key) = d9us6_host_egress_state_with_registry(
+                EGRESS_GOVERNANCE_CONNECTOR,
+                EGRESS_GOVERNANCE_OPERATION,
+                registry,
+                credential_id,
+                json!({
+                    "host_allow": ["127.0.0.1"],
+                    "http": {"bearer_token": "admission-secret"},
+                    "tcp": {"auth": "admission-secret"},
+                }),
+            )
+            .await;
+            let token = d9us6_token_with_credentials(
+                &signing_key,
+                EGRESS_GOVERNANCE_OPERATION,
+                vec![credential_id],
+            );
+            let error = fcp_async_core::time::timeout(
+                Duration::from_secs(2),
+                egress_governance_request(
+                    Arc::clone(&state),
+                    protocol,
+                    addr,
+                    credential_id,
+                    &token,
+                ),
+            )
+            .await
+            .expect("initial admission must obey the operation's 75ms total budget")
+            .expect_err("stalled introspection must time out before credential acquisition");
+            assert!(
+                error.1.contains("deadline exhausted during authorization"),
+                "{error:?}"
+            );
+            assert!(!error.1.contains("admission-secret"));
+            assert_eq!(introspections.load(Ordering::SeqCst), 1);
+            assert!(
+                state
+                    .credential_pools
+                    .lock()
+                    .await
+                    .redacted_views(Utc::now())
+                    .iter()
+                    .flat_map(|pool| &pool.entries)
+                    .all(|entry| entry.active_leases == 0),
+                "timed-out admission must not consume credential reservations"
+            );
+            assert_eq!(
+                listener.accept().unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock
+            );
+            let _ = release.send(());
+        }
+    }
+
+    #[fcp_async_core::runtime::test(flavor = "multi_thread")]
+    async fn host_egress_authorization_bounds_unreadable_inventory_and_recovers() {
+        let introspections = Arc::new(AtomicU64::new(0));
+        let registry = d9us6_host_egress_registry_with_catalog(
+            EGRESS_GOVERNANCE_CONNECTOR,
+            EGRESS_GOVERNANCE_OPERATION,
+            d9us6_loopback_constraints(443),
+            dispatcher_introspection(
+                EGRESS_GOVERNANCE_OPERATION,
+                "cap.test.egress",
+                SafetyTier::Safe,
+            ),
+            Arc::clone(&introspections),
+        );
+        let credential_id = CredentialId::parse("0face000-4444-4444-8444-444444444444").unwrap();
+        let (state, signing_key) = d9us6_host_egress_state_with_registry(
+            EGRESS_GOVERNANCE_CONNECTOR,
+            EGRESS_GOVERNANCE_OPERATION,
+            registry,
+            credential_id,
+            json!({"host_allow": ["127.0.0.1"]}),
+        )
+        .await;
+        let token = d9us6_token_with_credentials(
+            &signing_key,
+            EGRESS_GOVERNANCE_OPERATION,
+            vec![credential_id],
+        );
+        let context = d9us6_host_egress_context(
+            EGRESS_GOVERNANCE_CONNECTOR,
+            EGRESS_GOVERNANCE_OPERATION,
+            "req-inventory-budget",
+            "corr-inventory-budget",
+            &token,
+        );
+        let inventory = state.registry.state.write().await;
+        let error = fcp_async_core::time::timeout(
+            HOST_EGRESS_POLICY_READ_TIMEOUT + Duration::from_secs(2),
+            authorize_host_egress_context(&state, &context, "https://127.0.0.1/", Instant::now()),
+        )
+        .await
+        .expect("the host ceiling must bound unreadable inventory even before policy is known")
+        .expect_err("held inventory cannot admit egress");
+        assert!(
+            error
+                .to_string()
+                .contains("deadline exhausted during authorization")
+        );
+        assert_eq!(introspections.load(Ordering::SeqCst), 0);
+        drop(inventory);
+
+        authorize_host_egress_context(&state, &context, "https://127.0.0.1/", Instant::now())
+            .await
+            .expect("a later request can use inventory after the abandoned waiter is released");
+        assert_eq!(introspections.load(Ordering::SeqCst), 1);
+
+        // Keep the original lifecycle generation while blocked on inventory.
+        // Re-enabling the connector authorizes new work, never this old waiter.
+        let inventory = state.registry.state.write().await;
+        let mut waiting = Box::pin(authorize_host_egress_context(
+            &state,
+            &context,
+            "https://127.0.0.1/",
+            Instant::now(),
+        ));
+        assert!(futures_util::poll!(waiting.as_mut()).is_pending());
+        let connector_id = ConnectorId::from_static(EGRESS_GOVERNANCE_CONNECTOR);
+        for desired in [
+            fcp_host::DesiredRuntimeState::Disabled,
+            fcp_host::DesiredRuntimeState::Enabled,
+        ] {
+            state
+                .lifecycle
+                .set_desired_state(&connector_id, desired, None)
+                .await
+                .unwrap();
+        }
+        drop(inventory);
+        waiting
+            .await
+            .expect_err("disable/re-enable must fence queued admission");
+        assert_eq!(introspections.load(Ordering::SeqCst), 1);
+        authorize_host_egress_context(&state, &context, "https://127.0.0.1/", Instant::now())
+            .await
+            .expect("fresh authority after re-enable remains usable");
+        assert_eq!(introspections.load(Ordering::SeqCst), 2);
+    }
+
+    #[fcp_async_core::runtime::test(flavor = "multi_thread")]
+    async fn host_egress_authorization_does_not_renew_the_original_deadline() {
+        let introspections = Arc::new(AtomicU64::new(0));
+        let mut constraints = d9us6_loopback_constraints(443);
+        constraints.total_timeout_ms = 10_000;
+        let registry = d9us6_host_egress_registry_with_catalog(
+            EGRESS_GOVERNANCE_CONNECTOR,
+            EGRESS_GOVERNANCE_OPERATION,
+            constraints,
+            dispatcher_introspection(
+                EGRESS_GOVERNANCE_OPERATION,
+                "cap.test.egress",
+                SafetyTier::Safe,
+            ),
+            Arc::clone(&introspections),
+        );
+        let credential_id = CredentialId::parse("0face000-5555-4555-8555-555555555555").unwrap();
+        let (state, signing_key) = d9us6_host_egress_state_with_registry(
+            EGRESS_GOVERNANCE_CONNECTOR,
+            EGRESS_GOVERNANCE_OPERATION,
+            registry,
+            credential_id,
+            json!({"host_allow": ["127.0.0.1"]}),
+        )
+        .await;
+        let token = d9us6_token_with_credentials(
+            &signing_key,
+            EGRESS_GOVERNANCE_OPERATION,
+            vec![credential_id],
+        );
+        let context = d9us6_host_egress_context(
+            EGRESS_GOVERNANCE_CONNECTOR,
+            EGRESS_GOVERNANCE_OPERATION,
+            "req-original-budget",
+            "corr-original-budget",
+            &token,
+        );
+        let expired = Instant::now().checked_sub(Duration::from_secs(11)).unwrap();
+        let error = authorize_host_egress_context(&state, &context, "https://127.0.0.1/", expired)
+            .await
+            .expect_err("policy discovery must not grant an expired request a fresh budget");
+        assert!(
+            error
+                .to_string()
+                .contains("deadline exhausted during authorization")
+        );
+        assert_eq!(introspections.load(Ordering::SeqCst), 0);
+
+        // The five-second inventory ceiling bounds each policy read, not the
+        // entire request. A longer configured operation can still revalidate.
+        let started_at = Instant::now().checked_sub(Duration::from_secs(6)).unwrap();
+        let authorized =
+            authorize_host_egress_context(&state, &context, "https://127.0.0.1/", started_at)
+                .await
+                .expect("a longer operation retains its original remaining allowance");
+        let remaining = authorized.remaining_budget(started_at, "HTTP").unwrap();
+        assert!(remaining < Duration::from_secs(4));
+        assert_eq!(introspections.load(Ordering::SeqCst), 1);
+    }
+
+    #[fcp_async_core::runtime::test(flavor = "multi_thread")]
     async fn host_egress_inventory_scope_denies_http_and_tcp_before_runtime_or_credentials() {
         for protocol in ["http", "tcp"] {
             for (case, expected) in [
@@ -29017,7 +29320,7 @@ output_schema = { type = "object" }
             } else {
                 format!("tcp://{addr}")
             };
-            let admitted = authorize_host_egress_context(&state, &context, &resource)
+            let admitted = authorize_host_egress_context(&state, &context, &resource, Instant::now())
                 .await
                 .expect("matching inventory and manifest admit transport");
             // The manifest requires a connector input object with a message.
@@ -30327,9 +30630,10 @@ output_schema = { type = "object" }
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let (state, request) = d9us6_redirect_fixture(addr, vec!["*".to_owned()], Vec::new()).await;
-        let authorized = authorize_host_egress_context(&state, &request.context, &request.url)
-            .await
-            .unwrap();
+        let authorized =
+            authorize_host_egress_context(&state, &request.context, &request.url, Instant::now())
+                .await
+                .unwrap();
         let lease = acquire_host_egress_credential_lease(
             &state,
             &authorized.zone_id,
@@ -32064,9 +32368,10 @@ output_schema = { type = "object" }
                 3_000,
             )
             .await;
-            let authorized = authorize_host_egress_context(&state, &request.context, &request.url)
-                .await
-                .expect("authorize refresh fixture");
+            let authorized =
+                authorize_host_egress_context(&state, &request.context, &request.url, Instant::now())
+                    .await
+                    .expect("authorize refresh fixture");
             let credential_id =
                 CredentialId::parse(request.credential_id.as_deref().unwrap()).unwrap();
             let (first_lease, second_lease) = {
@@ -32250,9 +32555,10 @@ output_schema = { type = "object" }
             3_000,
         )
         .await;
-        let authorized = authorize_host_egress_context(&state, &request.context, &request.url)
-            .await
-            .unwrap();
+        let authorized =
+            authorize_host_egress_context(&state, &request.context, &request.url, Instant::now())
+                .await
+                .unwrap();
         let lease_guard = acquire_host_egress_credential_lease(
             &state,
             &authorized.zone_id,
@@ -32308,9 +32614,10 @@ output_schema = { type = "object" }
             3_000,
         )
         .await;
-        let authorized = authorize_host_egress_context(&state, &request.context, &request.url)
-            .await
-            .unwrap();
+        let authorized =
+            authorize_host_egress_context(&state, &request.context, &request.url, Instant::now())
+                .await
+                .unwrap();
         let lease_guard = acquire_host_egress_credential_lease(
             &state,
             &authorized.zone_id,
@@ -32795,6 +33102,7 @@ output_schema = { type = "object" }
             &state,
             &request.context,
             &format!("tcp://{}:{}", request.host, request.port),
+            Instant::now(),
         )
         .await
         .unwrap();
