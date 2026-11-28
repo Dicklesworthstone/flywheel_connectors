@@ -3,19 +3,20 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use fcp_async_core::channel::{broadcast, oneshot, watch};
 use fcp_prelude::{
-    AgentHint, ApprovalMode, BaseConnector, CapabilityGrant, CapabilityId, CapabilityVerifier,
-    ConnectorId, ConnectorMetrics, EventCaps, EventData, EventEnvelope, EventInfo, FcpConnector,
-    FcpError, FcpResult, HandshakeRequest, HandshakeResponse, HealthSnapshot, IdempotencyClass,
-    InstanceId, Introspection, InvokeRequest, InvokeResponse, OperationId, OperationInfo,
-    OrderingPolicy, Principal, ReplayBufferInfo, RiskLevel, SafetyTier, SelfCheckReport, SessionId,
-    ShutdownRequest, SimulateRequest, SimulateResponse, SubscribeRequest, SubscribeResponse,
-    SubscribeResult, TrustLevel, UnsubscribeRequest, ZoneId,
+    AgentHint, ApprovalMode, BaseConnector, CapabilityGrant, CapabilityId, CapabilityToken,
+    CapabilityVerifier, ConnectorId, ConnectorMetrics, EventCaps, EventData, EventEnvelope,
+    EventInfo, FcpConnector, FcpError, FcpResult, HandshakeRequest, HandshakeResponse,
+    HealthSnapshot, IdempotencyClass, InstanceId, Introspection, InvokeRequest, InvokeResponse,
+    OperationId, OperationInfo, OrderingPolicy, Principal, ReplayBufferInfo, RiskLevel, SafetyTier,
+    SelfCheckReport, SessionId, ShutdownRequest, SimulateRequest, SimulateResponse,
+    SubscribeRequest, SubscribeResponse, SubscribeResult, TrustLevel, UnsubscribeRequest, ZoneId,
 };
+use fcp_sdk::prelude::JsonlEventStream;
 use fcp_sdk::runtime::SupervisorConfig;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -36,6 +37,119 @@ const OP_SEND_MESSAGE: &str = "email_generic.send_message";
 const EVENT_INBOUND_PREVIEW: &str = "email.inbound.preview";
 const INBOUND_EVENT_BUFFER_CAPACITY: usize = 128;
 const INBOUND_EVENT_BUFFER_CAPACITY_U32: u32 = 128;
+const NATIVE_SUBSCRIBE_OPERATION: &str = "email_generic.subscribe";
+const NATIVE_EVENT_RESOURCE: &str = "email_generic:events:email.inbound.preview";
+const NATIVE_EVENT_ACK_TIMEOUT: Duration = Duration::from_secs(30);
+
+struct EmailNativeEventTransport {
+    stream: JsonlEventStream,
+    subscription: Option<Arc<EmailNativeSubscription>>,
+}
+
+impl std::fmt::Debug for EmailNativeEventTransport {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("EmailNativeEventTransport")
+            .field("open", &self.stream.is_open())
+            .finish_non_exhaustive()
+    }
+}
+
+struct EmailNativeSubscription {
+    stream: JsonlEventStream,
+    stream_id: String,
+    token: Mutex<CapabilityToken>,
+    verifier: CapabilityVerifier,
+}
+
+impl EmailNativeSubscription {
+    fn verify_authority(&self) -> FcpResult<()> {
+        let token = self
+            .token
+            .lock()
+            .map_err(|_| FcpError::Internal {
+                message: "email event authority lock poisoned".into(),
+            })?
+            .clone();
+        let verified = self.verifier.verify_bound(
+            token,
+            &CapabilityId::from_static(CAP_READ),
+            &OperationId::from_static(NATIVE_SUBSCRIBE_OPERATION),
+            &[NATIVE_EVENT_RESOURCE.to_owned()],
+        )?;
+        let expiration =
+            verified
+                .claims()
+                .get_expiration()
+                .ok_or_else(|| FcpError::MissingField {
+                    field: "capability_token.exp".into(),
+                })?;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| FcpError::Internal {
+                message: "system clock precedes the Unix epoch".into(),
+            })?
+            .as_secs();
+        if expiration <= 0 || now >= u64::try_from(expiration).unwrap_or(0) {
+            return Err(FcpError::TokenExpired);
+        }
+        Ok(())
+    }
+
+    fn require_active(&self) -> FcpResult<()> {
+        if !self.stream.accepts(EVENT_INBOUND_PREVIEW) {
+            return Err(native_event_unavailable(
+                "email native event stream is closed",
+            ));
+        }
+        self.verify_authority()
+    }
+
+    async fn deliver(
+        &self,
+        mut event: EventEnvelope,
+        shutdown: &mut watch::Receiver<bool>,
+    ) -> FcpResult<()> {
+        self.require_active()?;
+        if *shutdown.borrow() {
+            return Err(native_event_unavailable("email event delivery stopped"));
+        }
+        event.requires_ack = true;
+        event.data.zone_id = self.verifier.zone_id.clone();
+        let mut delivery = self.stream.deliver(&event)?;
+        let result = fcp_async_core::time::timeout(NATIVE_EVENT_ACK_TIMEOUT, async {
+            loop {
+                fcp_async_core::select! {
+                    biased;
+                    _ = shutdown.changed() => {
+                        return Err(native_event_unavailable("email event delivery stopped before ACK"));
+                    },
+                    result = &mut delivery => return result,
+                    () = fcp_async_core::time::sleep(Duration::from_millis(200)) => {
+                        self.require_active()?;
+                    }
+                }
+            }
+        }).await.map_err(|_| native_event_unavailable(
+            "email downstream acknowledgement timed out; mailbox cursor was not advanced",
+        ))?;
+        result?;
+        self.require_active()?;
+        if *shutdown.borrow() {
+            return Err(native_event_unavailable(
+                "email event delivery stopped after ACK",
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn native_event_unavailable(message: &str) -> FcpError {
+    FcpError::ConnectorUnavailable {
+        code: 5001,
+        message: message.into(),
+    }
+}
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct DoctorCheck {
@@ -190,13 +304,19 @@ impl EmailInboundMonitorRuntime {
         zone: ZoneId,
         connector_id: ConnectorId,
         instance_id: InstanceId,
+        native_subscription: Option<Arc<EmailNativeSubscription>>,
     ) -> FcpResult<bool> {
         let mut task_state = self.state.lock().map_err(|_| FcpError::Internal {
             message: "email inbound monitor state lock poisoned".into(),
         })?;
-        if task_state.task.is_some() {
+        if task_state
+            .task
+            .as_ref()
+            .is_some_and(|task| !task.is_finished())
+        {
             return Ok(false);
         }
+        task_state.task = None;
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let event_tx = self.event_tx.clone();
@@ -215,6 +335,7 @@ impl EmailInboundMonitorRuntime {
                 progress,
                 monitor_stats,
                 shutdown_rx,
+                native_subscription,
             )
             .await;
         });
@@ -294,6 +415,8 @@ pub struct EmailGenericConnector {
     started_at: Instant,
     verifier: Option<CapabilityVerifier>,
     zone: Option<ZoneId>,
+    native_events: Option<EmailNativeEventTransport>,
+    read_events_granted: bool,
 }
 
 impl EmailGenericConnector {
@@ -307,6 +430,8 @@ impl EmailGenericConnector {
             started_at: Instant::now(),
             verifier: None,
             zone: None,
+            native_events: None,
+            read_events_granted: false,
         }
     }
 
@@ -322,6 +447,146 @@ impl EmailGenericConnector {
 
     pub fn subscribe_events(&self) -> broadcast::Receiver<FcpResult<EventEnvelope>> {
         self.monitor.subscribe_events()
+    }
+
+    /// Attach the process event transport before configuring a session.
+    pub fn attach_event_stream(&mut self, stream: JsonlEventStream) -> FcpResult<()> {
+        if self.config.is_some() || self.verifier.is_some() || self.native_events.is_some() {
+            return Err(FcpError::InvalidRequest {
+                code: 1003,
+                message: "email native transport must be attached before configuration".into(),
+            });
+        }
+        self.native_events = Some(EmailNativeEventTransport {
+            stream,
+            subscription: None,
+        });
+        Ok(())
+    }
+
+    fn close_native_subscription(&mut self) {
+        if let Some(native) = self.native_events.as_mut() {
+            native.stream.close();
+            native.subscription = None;
+        }
+    }
+
+    /// Authorize one host-issued stream and start acknowledged native polling.
+    pub async fn handle_native_subscribe(&mut self, params: Value) -> FcpResult<Value> {
+        self.base.check_ready()?;
+        if !self.read_events_granted {
+            return Err(FcpError::CapabilityDenied {
+                capability: CAP_READ.into(),
+                reason: "email read capability was not granted during handshake".into(),
+            });
+        }
+        let stream_id = params
+            .get("stream_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| FcpError::InvalidRequest {
+                code: 1003,
+                message: "email subscribe requires a host-issued stream_id".into(),
+            })?
+            .to_owned();
+        let request: SubscribeRequest =
+            serde_json::from_value(params).map_err(|_| FcpError::InvalidRequest {
+                code: 1003,
+                message: "invalid email native subscribe request".into(),
+            })?;
+        if request.r#type != "subscribe"
+            || request.topics != [EVENT_INBOUND_PREVIEW]
+            || request.since.is_some()
+            || request.max_events_per_sec.is_some()
+            || request.batch_ms.is_some()
+        {
+            return Err(FcpError::InvalidRequest {
+                code: 1003,
+                message: "email native subscribe requires one exact topic without replay, batching, or rate options".into(),
+            });
+        }
+        let token = request
+            .capability_token
+            .ok_or_else(|| FcpError::InvalidRequest {
+                code: 1003,
+                message: "email subscribe requires capability_token".into(),
+            })?;
+        let verifier = self
+            .verifier
+            .as_ref()
+            .ok_or(FcpError::NotHandshaken)?
+            .clone();
+        let stream = self
+            .native_events
+            .as_ref()
+            .ok_or_else(|| native_event_unavailable("email native event transport unavailable"))?
+            .stream
+            .clone();
+        let candidate = Arc::new(EmailNativeSubscription {
+            stream: stream.clone(),
+            stream_id: stream_id.clone(),
+            token: Mutex::new(token),
+            verifier,
+        });
+        candidate.verify_authority()?;
+
+        // A replacement stream cannot overlap the preceding monitor, including
+        // an ACK waiter or an IMAP worker returning after cancellation.
+        if !stream.is_open() {
+            self.monitor.stop().await;
+        }
+        stream.open(
+            &stream_id,
+            EVENT_INBOUND_PREVIEW,
+            request.window_size.unwrap_or(1),
+        )?;
+        let native = self
+            .native_events
+            .as_mut()
+            .ok_or_else(|| native_event_unavailable("email native transport unavailable"))?;
+        let subscription =
+            if let Some(active) = native
+                .subscription
+                .as_ref()
+                .filter(|active| active.stream_id == stream_id && active.stream.is_open())
+            {
+                let token = candidate
+                    .token
+                    .lock()
+                    .map_err(|_| native_event_unavailable("email event authority lock poisoned"))?
+                    .clone();
+                *active.token.lock().map_err(|_| {
+                    native_event_unavailable("email event authority lock poisoned")
+                })? = token;
+                Arc::clone(active)
+            } else {
+                native.subscription = Some(Arc::clone(&candidate));
+                candidate
+            };
+        let result = self.monitor.ensure_running(
+            self.client.as_ref().ok_or(FcpError::NotConfigured)?.clone(),
+            self.config.as_ref().ok_or(FcpError::NotConfigured)?.clone(),
+            self.zone.clone().ok_or(FcpError::NotHandshaken)?,
+            self.base.id.clone(),
+            self.base.instance_id.clone(),
+            Some(subscription),
+        );
+        if let Err(error) = result {
+            self.close_native_subscription();
+            return Err(error);
+        }
+        serde_json::to_value(SubscribeResponse {
+            r#type: "response".into(),
+            id: request.id,
+            result: SubscribeResult {
+                confirmed_topics: vec![EVENT_INBOUND_PREVIEW.into()],
+                cursors: HashMap::new(),
+                replay_supported: false,
+                buffer: None,
+            },
+        })
+        .map_err(|_| FcpError::Internal {
+            message: "could not encode email subscription response".into(),
+        })
     }
 
     fn inbound_monitor_state(&self) -> serde_json::Value {
@@ -1126,6 +1391,7 @@ impl FcpConnector for EmailGenericConnector {
         let config = EmailGenericConfig::from_value(config)?;
         let client =
             EmailGenericClient::from_config(&config).map_err(|error| error.to_fcp_error())?;
+        self.close_native_subscription();
         self.monitor.stop().await;
         self.monitor.reset_progress()?;
         self.config = Some(config);
@@ -1134,10 +1400,24 @@ impl FcpConnector for EmailGenericConnector {
         self.base.set_handshaken(false);
         self.verifier = None;
         self.zone = None;
+        self.read_events_granted = false;
         Ok(())
     }
 
     async fn handshake(&mut self, req: HandshakeRequest) -> FcpResult<HandshakeResponse> {
+        if self.config.is_none() || self.client.is_none() {
+            return Err(FcpError::NotConfigured);
+        }
+        self.close_native_subscription();
+        self.monitor.stop().await;
+        self.monitor.reset_progress()?;
+        if let Some(instance_id) = req.requested_instance_id {
+            self.base.instance_id = instance_id;
+        }
+        self.read_events_granted = req
+            .capabilities_requested
+            .iter()
+            .any(|capability| capability.as_str() == CAP_READ);
         self.base.set_handshaken(true);
         self.verifier = Some(CapabilityVerifier::new(
             req.host_public_key,
@@ -1155,7 +1435,7 @@ impl FcpConnector for EmailGenericConnector {
                 streaming: true,
                 replay: false,
                 min_buffer_events: INBOUND_EVENT_BUFFER_CAPACITY_U32,
-                requires_ack: false,
+                requires_ack: self.native_events.is_some(),
             }),
             auth_caps: None,
             op_catalog_hash: None,
@@ -1203,12 +1483,14 @@ impl FcpConnector for EmailGenericConnector {
     }
 
     async fn shutdown(&mut self, _req: ShutdownRequest) -> FcpResult<()> {
+        self.close_native_subscription();
         self.monitor.stop().await;
         self.monitor.reset_progress()?;
         self.config = None;
         self.client = None;
         self.verifier = None;
         self.zone = None;
+        self.read_events_granted = false;
         self.base.set_handshaken(false);
         self.base.set_configured(false);
         Ok(())
@@ -1220,7 +1502,7 @@ impl FcpConnector for EmailGenericConnector {
             events: vec![EventInfo {
                 topic: EVENT_INBOUND_PREVIEW.into(),
                 schema: Self::inbound_event_schema(),
-                requires_ack: false,
+                requires_ack: self.native_events.is_some(),
             }],
             resource_types: Vec::new(),
             auth_caps: None,
@@ -1228,7 +1510,7 @@ impl FcpConnector for EmailGenericConnector {
                 streaming: true,
                 replay: false,
                 min_buffer_events: INBOUND_EVENT_BUFFER_CAPACITY_U32,
-                requires_ack: false,
+                requires_ack: self.native_events.is_some(),
             }),
         }
     }
@@ -1280,6 +1562,13 @@ impl FcpConnector for EmailGenericConnector {
 
     async fn subscribe(&self, req: SubscribeRequest) -> FcpResult<SubscribeResponse> {
         self.base.check_ready()?;
+        if self.native_events.is_some() {
+            return Err(FcpError::InvalidRequest {
+                code: 1003,
+                message: "native email subscriptions require the authorized stream control handler"
+                    .into(),
+            });
+        }
         let confirmed_topics = confirm_inbound_topics(&req.topics)?;
         let client = self.client.as_ref().ok_or(FcpError::NotConfigured)?.clone();
         let config = self.config.as_ref().ok_or(FcpError::NotConfigured)?.clone();
@@ -1290,6 +1579,7 @@ impl FcpConnector for EmailGenericConnector {
             zone,
             self.base.id.clone(),
             self.base.instance_id.clone(),
+            None,
         )?;
         Ok(SubscribeResponse {
             r#type: "response".into(),
@@ -1308,6 +1598,9 @@ impl FcpConnector for EmailGenericConnector {
 
     async fn unsubscribe(&self, req: UnsubscribeRequest) -> FcpResult<()> {
         let _ = confirm_inbound_topics(&req.topics)?;
+        if let Some(native) = self.native_events.as_ref() {
+            native.stream.close();
+        }
         self.monitor.stop().await;
         Ok(())
     }
@@ -1370,6 +1663,7 @@ async fn run_email_inbound_monitor(
     progress: Arc<Mutex<EmailInboundProgress>>,
     stats: Arc<Mutex<EmailInboundMonitorStats>>,
     mut shutdown: watch::Receiver<bool>,
+    native_subscription: Option<Arc<EmailNativeSubscription>>,
 ) {
     let supervisor = SupervisorConfig {
         base_backoff_ms: 250,
@@ -1386,6 +1680,16 @@ async fn run_email_inbound_monitor(
             update_monitor_stats(&stats, |stats| {
                 stats.status = "stopped".into();
                 stats.reason = "supervised inbound monitor observed shutdown before polling".into();
+            });
+            return;
+        }
+        if let Some(native) = native_subscription.as_ref()
+            && native.require_active().is_err()
+        {
+            native.stream.close();
+            update_monitor_stats(&stats, |stats| {
+                stats.status = "stopped".into();
+                stats.reason = "native event stream closed or its authority expired".into();
             });
             return;
         }
@@ -1441,20 +1745,29 @@ async fn run_email_inbound_monitor(
         match poll_result {
             Ok(batch) => {
                 consecutive_failures = 0;
-                let (emitted, dropped, publication_failed) = emit_inbound_preview_events(
-                    &InboundEventEmitContext {
-                        config: &config,
-                        zone: &zone,
-                        connector_id: &connector_id,
-                        instance_id: &instance_id,
-                        event_tx: &event_tx,
-                        next_event_seq: &next_event_seq,
-                        mailbox: &mailbox,
-                    },
-                    batch,
-                    &snapshot,
-                    &progress,
-                );
+                let context = InboundEventEmitContext {
+                    config: &config,
+                    zone: &zone,
+                    connector_id: &connector_id,
+                    instance_id: &instance_id,
+                    event_tx: &event_tx,
+                    next_event_seq: &next_event_seq,
+                    mailbox: &mailbox,
+                };
+                let (emitted, dropped, publication_failed) =
+                    if let Some(native) = native_subscription.as_ref() {
+                        emit_native_inbound_preview_events(
+                            &context,
+                            batch,
+                            &snapshot,
+                            &progress,
+                            native,
+                            &mut shutdown,
+                        )
+                        .await
+                    } else {
+                        emit_inbound_preview_events(&context, batch, &snapshot, &progress)
+                    };
                 update_monitor_stats(&stats, |stats| {
                     stats.polls_completed = stats.polls_completed.saturating_add(1);
                     stats.emitted_events = stats
@@ -1466,12 +1779,17 @@ async fn run_email_inbound_monitor(
                     if publication_failed {
                         stats.reason =
                             "event publication failed; unacknowledged UIDs will be retried".into();
-                        stats.last_error = Some("inbound event could not be enqueued".into());
+                        stats.last_error = Some("inbound event delivery did not complete".into());
                     } else {
                         stats.reason = "last supervised inbound poll completed".into();
                         stats.last_error = None;
                     }
                 });
+                if publication_failed && let Some(native) = native_subscription.as_ref() {
+                    native.stream.close();
+                    update_monitor_stats(&stats, |stats| stats.status = "stopped".into());
+                    return;
+                }
                 if fcp_async_core::shutdown::sleep_or_shutdown(poll_interval, &mut shutdown)
                     .await
                     .is_err()
@@ -1579,47 +1897,9 @@ where
     let Ok(mut progress) = progress.lock() else {
         return (0, 0, true);
     };
-    if progress.active_poll != Some(snapshot.generation)
-        || progress.cursor != snapshot.cursor
-        || batch.requested_cursor != snapshot.cursor
-        || batch.cursor.validate().is_err()
-        || batch.cursor.mailbox != context.mailbox
-        || batch.cursor.account_fingerprint
-            != EmailGenericClient::inbound_account_fingerprint(context.config, context.mailbox)
-    {
+    let Some(uids) = validate_inbound_batch(context, &batch, snapshot, &progress) else {
         return (0, 0, true);
-    }
-    if let Some(requested) = &snapshot.cursor
-        && (requested.account_fingerprint != batch.cursor.account_fingerprint
-            || requested.mailbox != batch.cursor.mailbox)
-    {
-        return (0, 0, true);
-    }
-    let expected_start = snapshot
-        .cursor
-        .as_ref()
-        .filter(|cursor| cursor.uid_validity == batch.cursor.uid_validity)
-        .map_or(0, |cursor| cursor.last_uid);
-    if batch.cursor.last_uid != expected_start {
-        return (0, 0, true);
-    }
-
-    // Validate the complete ordered batch before committing any prefix. A
-    // cancelled or older worker cannot reopen a prior epoch through this path.
-    let mut previous_uid = batch.cursor.last_uid;
-    let mut uids = Vec::with_capacity(batch.messages.len());
-    for message in &batch.messages {
-        let Some(uid) = message
-            .uid
-            .parse::<u32>()
-            .ok()
-            .filter(|uid| *uid > previous_uid && uid.to_string() == message.uid)
-        else {
-            return (0, 0, true);
-        };
-        previous_uid = uid;
-        uids.push(uid);
-    }
+    };
     progress.active_poll = None;
     let mut committed = batch.cursor;
     if batch.messages.is_empty() {
@@ -1641,28 +1921,6 @@ where
             dropped = dropped.saturating_add(1);
             continue;
         }
-        let sender = normalize_sender_address(&message.sender);
-        let payload = json!({
-            "mailbox": context.mailbox,
-            "uid": &message.uid,
-            "uid_validity": committed.uid_validity,
-            "sender": sender.clone(),
-            "policy_decision": "accept",
-            "preview": preview,
-        });
-        let principal = Principal {
-            kind: "email_sender".into(),
-            id: sender.unwrap_or_else(|| "unknown".into()),
-            trust: TrustLevel::Paired,
-            display: None,
-        };
-        let data = EventData::new(
-            context.connector_id.clone(),
-            context.instance_id.clone(),
-            context.zone.clone(),
-            principal,
-            payload,
-        );
         // The progress lock remains held across generation validation, enqueue,
         // and both commits. stop/reconfigure cannot fence between these steps.
         let Ok(mut next_event_seq) = context.next_event_seq.lock() else {
@@ -1674,11 +1932,7 @@ where
         };
         let mut event_cursor = committed.clone();
         event_cursor.last_uid = uid;
-        let envelope = EventEnvelope::new(EVENT_INBOUND_PREVIEW, data)
-            .with_seq(seq)
-            .with_cursor(event_cursor.event_cursor())
-            .with_stream_key(context.mailbox)
-            .with_ordering(OrderingPolicy::PerKey);
+        let envelope = inbound_preview_envelope(context, &message, preview, &event_cursor, seq);
         if !publish(envelope) {
             return (emitted, dropped, true);
         }
@@ -1689,6 +1943,200 @@ where
         emitted = emitted.saturating_add(1);
     }
     (emitted, dropped, false)
+}
+
+fn validate_inbound_batch(
+    context: &InboundEventEmitContext<'_>,
+    batch: &EmailInboundBatch,
+    snapshot: &InboundPollSnapshot,
+    progress: &EmailInboundProgress,
+) -> Option<Vec<u32>> {
+    if progress.active_poll != Some(snapshot.generation)
+        || progress.cursor != snapshot.cursor
+        || batch.requested_cursor != snapshot.cursor
+        || batch.cursor.validate().is_err()
+        || batch.cursor.mailbox != context.mailbox
+        || batch.cursor.account_fingerprint
+            != EmailGenericClient::inbound_account_fingerprint(context.config, context.mailbox)
+    {
+        return None;
+    }
+    if let Some(requested) = &snapshot.cursor
+        && (requested.account_fingerprint != batch.cursor.account_fingerprint
+            || requested.mailbox != batch.cursor.mailbox)
+    {
+        return None;
+    }
+    let expected_start = snapshot
+        .cursor
+        .as_ref()
+        .filter(|cursor| cursor.uid_validity == batch.cursor.uid_validity)
+        .map_or(0, |cursor| cursor.last_uid);
+    if batch.cursor.last_uid != expected_start {
+        return None;
+    }
+
+    // Validate the complete ordered batch before committing any prefix. A
+    // cancelled or older worker cannot reopen a prior epoch through this path.
+    let mut previous_uid = batch.cursor.last_uid;
+    let mut uids = Vec::with_capacity(batch.messages.len());
+    for message in &batch.messages {
+        let Some(uid) = message
+            .uid
+            .parse::<u32>()
+            .ok()
+            .filter(|uid| *uid > previous_uid && uid.to_string() == message.uid)
+        else {
+            return None;
+        };
+        previous_uid = uid;
+        uids.push(uid);
+    }
+    Some(uids)
+}
+
+async fn emit_native_inbound_preview_events(
+    context: &InboundEventEmitContext<'_>,
+    batch: EmailInboundBatch,
+    snapshot: &InboundPollSnapshot,
+    progress: &Mutex<EmailInboundProgress>,
+    subscription: &EmailNativeSubscription,
+    shutdown: &mut watch::Receiver<bool>,
+) -> (usize, usize, bool) {
+    let uids = {
+        let Ok(progress) = progress.lock() else {
+            return (0, 0, true);
+        };
+        let Some(uids) = validate_inbound_batch(context, &batch, snapshot, &progress) else {
+            return (0, 0, true);
+        };
+        uids
+    };
+    let mut committed = batch.cursor;
+    if batch.messages.is_empty() {
+        let Ok(mut progress) = progress.lock() else {
+            return (0, 0, true);
+        };
+        if progress.active_poll != Some(snapshot.generation)
+            || *shutdown.borrow()
+            || subscription.require_active().is_err()
+        {
+            return (0, 0, true);
+        }
+        progress.cursor = Some(committed);
+        progress.active_poll = None;
+        return (0, 0, false);
+    }
+    let mut emitted = 0_usize;
+    let mut dropped = 0_usize;
+    for (message, uid) in batch.messages.into_iter().zip(uids) {
+        if *shutdown.borrow() || subscription.require_active().is_err() {
+            return (emitted, dropped, true);
+        }
+        let preview = context
+            .config
+            .monitor_policy
+            .prepare_inbound_message(&message);
+        if preview.decision != EmailInboundPolicyDecision::Accept {
+            let Ok(mut progress) = progress.lock() else {
+                return (emitted, dropped, true);
+            };
+            if progress.active_poll != Some(snapshot.generation)
+                || *shutdown.borrow()
+                || subscription.require_active().is_err()
+            {
+                return (emitted, dropped, true);
+            }
+            committed.last_uid = uid;
+            progress.cursor = Some(committed.clone());
+            dropped = dropped.saturating_add(1);
+            continue;
+        }
+        let seq = {
+            let Ok(progress) = progress.lock() else {
+                return (emitted, dropped, true);
+            };
+            if progress.active_poll != Some(snapshot.generation)
+                || subscription.require_active().is_err()
+            {
+                return (emitted, dropped, true);
+            }
+            let Ok(next_event_seq) = context.next_event_seq.lock() else {
+                return (emitted, dropped, true);
+            };
+            *next_event_seq
+        };
+        let Some(following_seq) = seq.checked_add(1) else {
+            return (emitted, dropped, true);
+        };
+        let mut event_cursor = committed.clone();
+        event_cursor.last_uid = uid;
+        let envelope = inbound_preview_envelope(context, &message, preview, &event_cursor, seq);
+        // No synchronous lock crosses the host ACK wait. A stop or replacement
+        // may fence this generation while delivery is pending; that late result
+        // must never commit progress into the replacement monitor.
+        if subscription.deliver(envelope, shutdown).await.is_err() {
+            return (emitted, dropped, true);
+        }
+        let Ok(mut progress) = progress.lock() else {
+            return (emitted, dropped, true);
+        };
+        if progress.active_poll != Some(snapshot.generation)
+            || *shutdown.borrow()
+            || subscription.require_active().is_err()
+        {
+            return (emitted, dropped, true);
+        }
+        let Ok(mut next_event_seq) = context.next_event_seq.lock() else {
+            return (emitted, dropped, true);
+        };
+        if *next_event_seq != seq {
+            return (emitted, dropped, true);
+        }
+        *next_event_seq = following_seq;
+        committed = event_cursor;
+        progress.cursor = Some(committed.clone());
+        emitted = emitted.saturating_add(1);
+    }
+    let Ok(mut progress) = progress.lock() else {
+        return (emitted, dropped, true);
+    };
+    if progress.active_poll != Some(snapshot.generation) {
+        return (emitted, dropped, true);
+    }
+    progress.active_poll = None;
+    (emitted, dropped, false)
+}
+
+fn inbound_preview_envelope(
+    context: &InboundEventEmitContext<'_>,
+    message: &crate::types::EmailInboundMessage,
+    preview: crate::types::EmailInboundPreview,
+    cursor: &EmailInboundCursor,
+    seq: u64,
+) -> EventEnvelope {
+    let sender = normalize_sender_address(&message.sender);
+    let payload = json!({
+        "mailbox": context.mailbox, "uid": &message.uid, "uid_validity": cursor.uid_validity,
+        "sender": sender.clone(), "policy_decision": "accept", "preview": preview,
+    });
+    let data = EventData::new(
+        context.connector_id.clone(),
+        context.instance_id.clone(),
+        context.zone.clone(),
+        Principal {
+            kind: "email_sender".into(),
+            id: sender.unwrap_or_else(|| "unknown".into()),
+            trust: TrustLevel::Paired,
+            display: None,
+        },
+        payload,
+    );
+    EventEnvelope::new(EVENT_INBOUND_PREVIEW, data)
+        .with_seq(seq)
+        .with_cursor(cursor.event_cursor())
+        .with_stream_key(context.mailbox)
+        .with_ordering(OrderingPolicy::PerKey)
 }
 
 #[cfg(test)]
@@ -2095,6 +2543,452 @@ mod tests {
             .sign(signing_key)
             .expect("token should sign");
         CapabilityToken::from_raw(raw)
+    }
+
+    #[derive(Clone, Default)]
+    struct NativeCapture(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for NativeCapture {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    async fn captured_native_event(capture: &NativeCapture, index: usize) -> Value {
+        fcp_async_core::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let found = {
+                    let bytes = capture.0.lock().unwrap();
+                    bytes
+                        .split(|byte| *byte == b'\n')
+                        .filter(|line| !line.is_empty())
+                        .nth(index)
+                        .and_then(|line| serde_json::from_slice::<Value>(line).ok())
+                };
+                if let Some(frame) = found {
+                    return frame;
+                }
+                fcp_async_core::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .expect("native event frame")
+    }
+
+    fn native_ack(frame: &Value) -> Value {
+        let event = &frame["params"]["event"];
+        json!({
+            "stream_id": frame["params"]["stream_id"],
+            "ack": { "type": "ack", "topic": event["topic"], "seqs": [event["seq"]], "cursors": [event["cursor"]] }
+        })
+    }
+
+    fn start_native_test_batch(
+        config: EmailGenericConfig,
+        batch: EmailInboundBatch,
+        snapshot: InboundPollSnapshot,
+        progress: Arc<Mutex<EmailInboundProgress>>,
+        next_event_seq: Arc<Mutex<u64>>,
+        subscription: Arc<EmailNativeSubscription>,
+        mut shutdown: watch::Receiver<bool>,
+    ) -> fcp_async_core::task::JoinHandle<(usize, usize, bool)> {
+        fcp_async_core::task::spawn(async move {
+            let (event_tx, _) = broadcast::channel(INBOUND_EVENT_BUFFER_CAPACITY);
+            let context = InboundEventEmitContext {
+                config: &config,
+                zone: &subscription.verifier.zone_id,
+                connector_id: &ConnectorId::from_static("fcp.email-generic"),
+                instance_id: subscription
+                    .verifier
+                    .instance_id
+                    .as_ref()
+                    .expect("bound instance"),
+                event_tx: &event_tx,
+                next_event_seq: &next_event_seq,
+                mailbox: "Alerts",
+            };
+            emit_native_inbound_preview_events(
+                &context,
+                batch,
+                &snapshot,
+                &progress,
+                &subscription,
+                &mut shutdown,
+            )
+            .await
+        })
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn native_ack_commits_only_successful_prefix_and_replays_closed_tail() {
+        let config = inbound_test_config();
+        let instance = InstanceId::new();
+        let key = Ed25519SigningKey::generate();
+        let capture = NativeCapture::default();
+        let stream = JsonlEventStream::new(fcp_sdk::prelude::JsonlWriter::new(capture.clone()));
+        stream.open("first", EVENT_INBOUND_PREVIEW, 1).unwrap();
+        let subscription = Arc::new(EmailNativeSubscription {
+            stream: stream.clone(),
+            stream_id: "first".into(),
+            token: Mutex::new(capability_token(
+                &key,
+                instance.as_str(),
+                CAP_READ,
+                NATIVE_SUBSCRIBE_OPERATION,
+            )),
+            verifier: CapabilityVerifier::new(
+                key.verifying_key().to_bytes(),
+                ZoneId::private(),
+                instance,
+            ),
+        });
+        let progress = Arc::new(Mutex::new(EmailInboundProgress::default()));
+        let next_seq = Arc::new(Mutex::new(1_u64));
+        let snapshot = progress.lock().unwrap().begin_poll().unwrap();
+        let batch = inbound_test_batch(&config, &snapshot, 42, &[1, 2]);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let task = start_native_test_batch(
+            config.clone(),
+            batch,
+            snapshot,
+            Arc::clone(&progress),
+            Arc::clone(&next_seq),
+            Arc::clone(&subscription),
+            shutdown_rx,
+        );
+        let first = captured_native_event(&capture, 0).await;
+        assert_eq!(first["params"]["event"]["requires_ack"], true);
+        assert_eq!(first["params"]["event"]["data"]["payload"]["uid"], "1");
+        assert!(
+            progress.lock().unwrap().cursor.is_none(),
+            "stdout write is not an ACK"
+        );
+        assert_eq!(*next_seq.lock().unwrap(), 1);
+        let mut wrong = native_ack(&first);
+        wrong["ack"]["cursors"] = json!(["wrong"]);
+        assert!(stream.acknowledge(wrong).is_err());
+        assert!(progress.lock().unwrap().cursor.is_none());
+        stream.acknowledge(native_ack(&first)).unwrap();
+        let second = captured_native_event(&capture, 1).await;
+        assert_eq!(second["params"]["event"]["seq"], 2);
+        assert_eq!(
+            progress.lock().unwrap().cursor.as_ref().unwrap().last_uid,
+            1
+        );
+        stream.close_named(&json!({"stream_id": "first"})).unwrap();
+        assert_eq!(task.await.unwrap(), (1, 0, true));
+        assert_eq!(
+            progress.lock().unwrap().cursor.as_ref().unwrap().last_uid,
+            1
+        );
+        assert_eq!(*next_seq.lock().unwrap(), 2);
+        assert!(stream.acknowledge(native_ack(&second)).is_err());
+
+        stream.open("second", EVENT_INBOUND_PREVIEW, 1).unwrap();
+        let snapshot = progress.lock().unwrap().begin_poll().unwrap();
+        let batch = inbound_test_batch(&config, &snapshot, 42, &[2]);
+        let task = start_native_test_batch(
+            config,
+            batch,
+            snapshot,
+            Arc::clone(&progress),
+            Arc::clone(&next_seq),
+            subscription,
+            shutdown_tx.subscribe(),
+        );
+        let replay = captured_native_event(&capture, 2).await;
+        assert_eq!(replay["params"]["stream_id"], "second");
+        for field in [
+            "topic",
+            "cursor",
+            "seq",
+            "data",
+            "requires_ack",
+            "stream_key",
+            "ordering",
+        ] {
+            assert_eq!(
+                replay["params"]["event"][field], second["params"]["event"][field],
+                "retry retains provider identity and payload: {field}"
+            );
+        }
+        stream.acknowledge(native_ack(&replay)).unwrap();
+        assert_eq!(task.await.unwrap(), (1, 0, false));
+        assert_eq!(
+            progress.lock().unwrap().cursor.as_ref().unwrap().last_uid,
+            2
+        );
+        assert_eq!(*next_seq.lock().unwrap(), 3);
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn native_late_ack_cannot_commit_across_a_poll_fence() {
+        let config = inbound_test_config();
+        let instance = InstanceId::new();
+        let key = Ed25519SigningKey::generate();
+        let capture = NativeCapture::default();
+        let stream = JsonlEventStream::new(fcp_sdk::prelude::JsonlWriter::new(capture.clone()));
+        stream.open("fenced", EVENT_INBOUND_PREVIEW, 1).unwrap();
+        let subscription = Arc::new(EmailNativeSubscription {
+            stream: stream.clone(),
+            stream_id: "fenced".into(),
+            token: Mutex::new(capability_token(
+                &key,
+                instance.as_str(),
+                CAP_READ,
+                NATIVE_SUBSCRIBE_OPERATION,
+            )),
+            verifier: CapabilityVerifier::new(
+                key.verifying_key().to_bytes(),
+                ZoneId::private(),
+                instance,
+            ),
+        });
+        let progress = Arc::new(Mutex::new(EmailInboundProgress::default()));
+        let seq = Arc::new(Mutex::new(1_u64));
+        let snapshot = progress.lock().unwrap().begin_poll().unwrap();
+        let batch = inbound_test_batch(&config, &snapshot, 42, &[7]);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let task = start_native_test_batch(
+            config,
+            batch,
+            snapshot,
+            Arc::clone(&progress),
+            Arc::clone(&seq),
+            subscription,
+            shutdown_rx,
+        );
+        let frame = captured_native_event(&capture, 0).await;
+        progress.lock().unwrap().fence();
+        stream.acknowledge(native_ack(&frame)).unwrap();
+        assert_eq!(task.await.unwrap(), (0, 0, true));
+        assert!(progress.lock().unwrap().cursor.is_none());
+        assert_eq!(*seq.lock().unwrap(), 1);
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn native_subscription_requires_exact_authority_and_host_instance() {
+        let mut connector = EmailGenericConnector::new();
+        let capture = NativeCapture::default();
+        let stream = JsonlEventStream::new(fcp_sdk::prelude::JsonlWriter::new(capture.clone()));
+        connector.attach_event_stream(stream.clone()).unwrap();
+        connector
+            .configure(serde_json::to_value(inbound_test_config()).unwrap())
+            .await
+            .unwrap();
+        let key = Ed25519SigningKey::generate();
+        let instance = InstanceId::new();
+        let mut handshake = handshake_request(key.verifying_key().to_bytes());
+        handshake.requested_instance_id = Some(instance.clone());
+        let response = connector.handshake(handshake).await.unwrap();
+        assert_eq!(connector.instance_id(), &instance);
+        assert!(response.event_caps.unwrap().requires_ack);
+        assert!(connector.introspect().events[0].requires_ack);
+        let base = json!({"type":"subscribe", "id":"subscription", "stream_id":"authorized", "topics":[EVENT_INBOUND_PREVIEW]});
+        assert!(
+            connector
+                .handle_native_subscribe(base.clone())
+                .await
+                .is_err()
+        );
+        let wrong_instance = InstanceId::new();
+        for token in [
+            capability_token(
+                &key,
+                instance.as_str(),
+                CAP_WRITE,
+                NATIVE_SUBSCRIBE_OPERATION,
+            ),
+            capability_token(&key, instance.as_str(), CAP_READ, OP_POLL_INBOUND_ONCE),
+            capability_token(
+                &key,
+                wrong_instance.as_str(),
+                CAP_READ,
+                NATIVE_SUBSCRIBE_OPERATION,
+            ),
+            capability_token(
+                &Ed25519SigningKey::generate(),
+                instance.as_str(),
+                CAP_READ,
+                NATIVE_SUBSCRIBE_OPERATION,
+            ),
+        ] {
+            let mut request = base.clone();
+            request["capability_token"] = serde_json::to_value(token).unwrap();
+            assert!(connector.handle_native_subscribe(request).await.is_err());
+        }
+        let token = capability_token(
+            &key,
+            instance.as_str(),
+            CAP_READ,
+            NATIVE_SUBSCRIBE_OPERATION,
+        );
+        for (field, value) in [
+            (
+                "topics",
+                json!([EVENT_INBOUND_PREVIEW, EVENT_INBOUND_PREVIEW]),
+            ),
+            ("since", json!({EVENT_INBOUND_PREVIEW: "untrusted"})),
+            ("batch_ms", json!(10)),
+            ("max_events_per_sec", json!(1)),
+            ("window_size", json!(65)),
+            ("stream_id", json!("bad/id")),
+        ] {
+            let mut request = base.clone();
+            request["capability_token"] = serde_json::to_value(&token).unwrap();
+            request[field] = value;
+            assert!(
+                connector.handle_native_subscribe(request).await.is_err(),
+                "must reject {field}"
+            );
+        }
+        let request: SubscribeRequest = serde_json::from_value(base.clone()).unwrap();
+        assert!(
+            connector.subscribe(request).await.is_err(),
+            "typed subscribe cannot bypass native authority"
+        );
+        assert!(!stream.is_open());
+        assert!(capture.0.lock().unwrap().is_empty());
+        assert!(connector.monitor.state.lock().unwrap().task.is_none());
+        let mut handshake = handshake_request(key.verifying_key().to_bytes());
+        handshake.capabilities_requested = vec![CapabilityId::from_static(CAP_WRITE)];
+        connector.handshake(handshake).await.unwrap();
+        let mut request = base;
+        request["capability_token"] = serde_json::to_value(token).unwrap();
+        assert!(
+            matches!(
+                connector.handle_native_subscribe(request).await,
+                Err(FcpError::CapabilityDenied { .. })
+            ),
+            "a valid read token cannot bypass the session's negotiated grants"
+        );
+        assert!(!stream.is_open());
+        assert!(connector.monitor.state.lock().unwrap().task.is_none());
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn closed_native_stream_cannot_commit_empty_or_policy_dropped_batches() {
+        let config = inbound_test_config();
+        let instance = InstanceId::new();
+        let key = Ed25519SigningKey::generate();
+        let stream =
+            JsonlEventStream::new(fcp_sdk::prelude::JsonlWriter::new(NativeCapture::default()));
+        stream.open("closed", EVENT_INBOUND_PREVIEW, 1).unwrap();
+        let subscription = Arc::new(EmailNativeSubscription {
+            stream: stream.clone(),
+            stream_id: "closed".into(),
+            token: Mutex::new(capability_token(
+                &key,
+                instance.as_str(),
+                CAP_READ,
+                NATIVE_SUBSCRIBE_OPERATION,
+            )),
+            verifier: CapabilityVerifier::new(
+                key.verifying_key().to_bytes(),
+                ZoneId::private(),
+                instance,
+            ),
+        });
+        stream.close();
+        let progress = Arc::new(Mutex::new(EmailInboundProgress::default()));
+        let seq = Arc::new(Mutex::new(1_u64));
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        for uids in [vec![], vec![7]] {
+            let snapshot = progress.lock().unwrap().begin_poll().unwrap();
+            let mut batch = inbound_test_batch(&config, &snapshot, 42, &uids);
+            for message in &mut batch.messages {
+                message.sender = "outside@example.com".into();
+            }
+            let task = start_native_test_batch(
+                config.clone(),
+                batch,
+                snapshot,
+                Arc::clone(&progress),
+                Arc::clone(&seq),
+                Arc::clone(&subscription),
+                shutdown_rx.clone(),
+            );
+            assert_eq!(task.await.unwrap(), (0, 0, true));
+            assert!(progress.lock().unwrap().cursor.is_none());
+            assert_eq!(*seq.lock().unwrap(), 1);
+        }
+        drop(shutdown_tx);
+    }
+
+    #[fcp_async_core::runtime::test]
+    async fn native_wait_stops_when_authority_expires_without_advancing_cursor() {
+        let config = inbound_test_config();
+        let instance = InstanceId::new();
+        let key = Ed25519SigningKey::generate();
+        let capture = NativeCapture::default();
+        let stream = JsonlEventStream::new(fcp_sdk::prelude::JsonlWriter::new(capture.clone()));
+        stream.open("expiring", EVENT_INBOUND_PREVIEW, 1).unwrap();
+        let subscription = Arc::new(EmailNativeSubscription {
+            stream: stream.clone(),
+            stream_id: "expiring".into(),
+            token: Mutex::new(capability_token(
+                &key,
+                instance.as_str(),
+                CAP_READ,
+                NATIVE_SUBSCRIBE_OPERATION,
+            )),
+            verifier: CapabilityVerifier::new(
+                key.verifying_key().to_bytes(),
+                ZoneId::private(),
+                instance.clone(),
+            ),
+        });
+        let progress = Arc::new(Mutex::new(EmailInboundProgress::default()));
+        let seq = Arc::new(Mutex::new(1_u64));
+        let snapshot = progress.lock().unwrap().begin_poll().unwrap();
+        let batch = inbound_test_batch(&config, &snapshot, 42, &[7]);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let task = start_native_test_batch(
+            config,
+            batch,
+            snapshot,
+            Arc::clone(&progress),
+            Arc::clone(&seq),
+            Arc::clone(&subscription),
+            shutdown_rx,
+        );
+        let frame = captured_native_event(&capture, 0).await;
+        let now = Utc::now();
+        let expired = CapabilityTokenBuilder::new()
+            .capability_id(CAP_READ)
+            .zone_id("z:private")
+            .target_instance(instance.as_str())
+            .principal("user:test")
+            .operations(&[NATIVE_SUBSCRIBE_OPERATION])
+            .issuer("node:test")
+            .validity(
+                now - ChronoDuration::minutes(1),
+                now - ChronoDuration::seconds(1),
+            )
+            .try_constraints_cbor(&test_constraints_cbor())
+            .unwrap()
+            .sign(&key)
+            .unwrap();
+        *subscription.token.lock().unwrap() = CapabilityToken::from_raw(expired);
+        assert_eq!(
+            fcp_async_core::time::timeout(Duration::from_secs(3), task)
+                .await
+                .unwrap()
+                .unwrap(),
+            (0, 0, true)
+        );
+        assert!(
+            !stream.is_open(),
+            "dropping the unacknowledged obligation closes its stream"
+        );
+        assert!(stream.acknowledge(native_ack(&frame)).is_err());
+        assert!(progress.lock().unwrap().cursor.is_none());
+        assert_eq!(*seq.lock().unwrap(), 1);
     }
 
     const EXPECTED_MANIFEST_SCHEMA_OPS: &[(&str, &str)] = &[

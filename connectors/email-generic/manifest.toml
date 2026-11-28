@@ -25,13 +25,17 @@ forbidden = ["system.exec", "system.privileged", "network.listen"]
 streaming = true
 replay = false
 min_buffer_events = 128
+requires_ack = true
 
 [provides.events.inbound_preview]
 description = "Accepted inbound email preview emitted after IMAP polling, sender policy, automated-mail suppression, UID dedupe, body bounding, attachment classification, and threading metadata shaping"
 streaming = true
 replay = false
 topic = "email.inbound.preview"
-requires_ack = false
+requires_ack = true
+capability = "email_generic.read"
+subscribe_operation = "email_generic.subscribe"
+resource_uri = "email_generic:events:email.inbound.preview"
 
 # IMAP and SMTP hosts are operator-configured and may point at public, private,
 # or tailnet infrastructure, so per-operation egress policy uses runtime-resolved

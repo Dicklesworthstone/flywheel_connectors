@@ -1,6 +1,6 @@
 # Generic Email Connector V1 Contract
 
-> **Status**: IMAP/SMTP runtime contract with supervised inbound polling and tested loopback fan-out
+> **Status**: IMAP/SMTP runtime contract with supervised inbound polling and acknowledged native JSONL delivery
 > **Bead**: `flywheel_connectors-4kw5f.4.2`
 > **Parent**: `flywheel_connectors-4kw5f`
 > **Verification script**: `scripts/e2e/email_generic_connector_verification.sh`
@@ -24,7 +24,7 @@ The current crate exposes these runtime operation IDs:
 - `email_generic.poll_inbound_once`
 - `email_generic.send_message`
 
-Subscribing to `email.inbound.preview` starts a supervised poller over the configured `monitor_policy.mailbox` on the IMAP account. Accepted messages are emitted through a bounded event fan-out channel after sender allowlist, automated-message suppression, account and mailbox epoch checks, body bounding, attachment classification, and thread metadata shaping.
+Subscribing to `email.inbound.preview` starts a supervised poller over the configured `monitor_policy.mailbox` on the IMAP account. The native executable delivers accepted messages through the shared JSONL event transport and waits for an exact host acknowledgement before advancing past each accepted UID. Sender allowlist, automated-message suppression, account and mailbox epoch checks, body bounding, attachment classification, and thread metadata shaping apply before delivery. Embedded callers without a native transport can use the existing bounded broadcast channel.
 
 The inbound poll-once surface is a read-only FCP invoke operation over the same bounded RFC822 parsing and monitor-policy preparation path. It returns a caller-owned `cursor` for account- and UIDVALIDITY-bound progress; pass that complete cursor into later polls. It does not own durable UID state. The legacy `seen_uids` input remains available as a bounded compatibility mode.
 
@@ -50,7 +50,8 @@ Important runtime truths the contract preserves:
 - Runtime computes `manifest_hash` from `manifest.toml`.
 - Runtime `invoke` verifies a bound capability token before provider dispatch.
 - Runtime `simulate` uses the same capability verifier and reports missing capabilities when appropriate.
-- Runtime `subscribe()` starts supervised `email.inbound.preview` fan-out; `unsubscribe()` and `shutdown()` signal and await the monitor task.
+- Native `subscribe` requires a host-issued stream ID and an instance-bound `email_generic.read` token authorizing `email_generic.subscribe` over `email_generic:events:email.inbound.preview`. `unsubscribe`, reconfiguration, rehandshake, shutdown, and transport retirement stop or fence pending delivery.
+- The native executable uses one persistent runtime and a bounded JSONL reader. ACK controls remain readable while ordinary RPC handlers run; responses and events share a serialized stdout writer. Successful shutdown exits without waiting for stdin EOF.
 
 ## Drift Visible In This Checkout
 
@@ -64,7 +65,7 @@ This README documents runtime truth and keeps current drift visible:
 - There is connector-local IMAP/SMTP loopback fixture coverage plus a tracked acceptance shell script for this connector.
 - IMAP parsing is intentionally narrow and does not implement full RFC 3501 mailbox, BODYSTRUCTURE, multipart rendering, flag mutation, or durable mailbox synchronization.
 
-A follow-up parity bead should decide durable UID-state ownership and replay/ack behavior if this connector graduates beyond bounded live fan-out.
+Durable UID-state ownership and cross-process recovery remain separate from the native transport's explicit acknowledgement boundary.
 
 ## First-Slice Scope
 
@@ -87,7 +88,7 @@ The current Generic Email README slice documents the existing runtime surface:
 - Allowed target zones: `z:private` and `z:work`.
 - Tailscale tag hint: `tag:fcp-private`.
 - Capability families:
-  - `email_generic.read` gates health metadata, mailbox listing, message search, and one-shot inbound polling.
+  - `email_generic.read` gates health metadata, mailbox listing, message search, one-shot inbound polling, and the native subscription control operation.
   - `email_generic.write` gates SMTP sends.
 - Required capabilities: `network.dns` and `network.outbound`.
 - Forbidden capabilities: `system.exec`, `system.privileged`, and `network.listen`.
@@ -106,7 +107,7 @@ The current Generic Email README slice documents the existing runtime surface:
 - `search_messages` rejects blank mailbox or query before sending IMAP commands.
 - Inbound polling opens the mailbox with `EXAMINE`, then sends `UID SEARCH UNSEEN` and per-UID `UID FETCH <uid> (UID BODY.PEEK[])`. These reads preserve the provider's `\Seen` flags. The monitor uses the explicit `monitor_policy.mailbox`; `poll_inbound_once` uses its requested mailbox and cursor, or legacy UID list when explicitly selected.
 - A complete FETCH response must identify the requested UID, close its attribute list, and finish with the exact successful tagged status. Failed fetches, malformed MIME, truncated responses, and oversized literals abort the connection and leave all candidates from that poll unacknowledged for a fresh-session retry.
-- Retrieval never advances a cursor. One-shot results return a checkpoint with the completed response; the supervised monitor advances it only after successful event enqueue or intentional policy rejection. Failed publication retains the successful prefix and leaves the failed UID and tail retryable, without consuming an event sequence. The existing bounded broadcast buffer remains best-effort delivery and does not provide durable acknowledgements or replay.
+- Retrieval never advances a cursor. One-shot results return a checkpoint with the completed response. The native monitor advances an accepted UID only after the host acknowledges its exact stream, topic, sequence, and cursor; explicit policy rejections also advance progress. Failed delivery retains the completed prefix and leaves the failed UID and tail retryable, without consuming an event sequence. The separate embedded broadcast mode commits on successful enqueue and remains best-effort delivery.
 - Modern polls require exactly one valid nonzero `UIDVALIDITY` from `EXAMINE`. A changed epoch restarts at UID zero; within the same epoch, both the server query and an independent client-side filter select UIDs above the committed high-water. This filter also handles IMAP's reversed `n:*` range behavior. An exhausted `u32::MAX` UID still checks the epoch and performs no overflowing range query.
 - RFC822 literals and response metadata are each capped at `1048576` bytes. A poll returns at most 128 messages and stops after reaching 8 MiB of raw message data (with at most one additional 1 MiB message); remaining UIDs can be fetched on the next poll.
 - `send_message` requires at least one `to` recipient.
@@ -127,7 +128,17 @@ The cursor tracks new message UIDs, not flag changes. Marking an older message u
 
 The supervised monitor retains its in-memory cursor across unsubscribe/resubscribe. Reconfiguration, shutdown, and process restart clear that monitor-owned progress; caller-persisted one-shot cursors remain subject to account/mailbox/epoch validation when reused. Poll generations fence cancelled workers and old sessions before enqueue, including when an epoch changes while a previous poll is still finishing. Progress follows only the successfully published or deliberately rejected prefix of an ordered batch.
 
-These checkpoints do not add durable event acknowledgements, replay buffers, or exactly-once delivery. A successful enqueue is the monitor's commit boundary; consumers must still handle the existing bounded broadcast behavior.
+Native acknowledgements protect the current process's progress; they do not persist the connector's mailbox cursor or add exactly-once delivery. A restart can replay unread messages. The host's retained event journal and consumers must use the account- and epoch-qualified event cursor to handle duplicates. Embedded broadcast subscribers continue to use enqueue as their commit boundary.
+
+## Native Event Subscription
+
+The host-pinned event declaration names capability `email_generic.read`, subscription operation `email_generic.subscribe`, and resource `email_generic:events:email.inbound.preview`. The native `subscribe` RPC accepts one exact topic, a host-issued `stream_id`, an instance-bound capability token, and an optional `window_size` from 1 through 64. The producer conservatively uses one event credit. Replay (`since`), rate, and batching options are rejected because this implementation does not provide those semantics.
+
+The connector honors `requested_instance_id` during handshake before constructing its verifier. It checks the subscription token's signature, instance, zone, operation, resource restriction, and expiry before polling and delivery, while waiting for ACK, and again before committing an acknowledged event. Repeating the same active stream subscription refreshes its valid token without replacing its pending event. A replacement stream waits for the preceding monitor to stop before starting another generation.
+
+Events use the SDK's `event` notification shape. The host sends an ID-less `ack` control with matching `stream_id` and an `ack` object containing `type:"ack"`, the exact topic, one sequence in `seqs`, and the matching cursor in `cursors`. Reading or flushing stdout alone never advances the mailbox cursor. A missing ACK times out after 30 seconds; wrong ACK identities are rejected. Stream closure, lost input, token expiry, shutdown, and failed writes leave the unacknowledged UID retryable. Event notifications are capped by the shared 256 KiB transport limit; reduce `max_body_chars` if a configured preview cannot fit.
+
+The in-process `subscribe_events()` broadcast API remains available for embedded usage. A connector with a native transport attached rejects the plain typed `subscribe()` entry point, so it cannot bypass native subscription admission.
 
 ## Inbound Monitor Policy Helpers
 
@@ -150,7 +161,7 @@ The supervised inbound monitor uses these poll-once and policy helpers before ev
 
 | Capability | Purpose |
 |-----------|---------|
-| `email_generic.read` | Read local health metadata, list IMAP mailboxes, search messages by UID, and run one-shot inbound polls. |
+| `email_generic.read` | Read local health metadata, list IMAP mailboxes, search messages by UID, run one-shot inbound polls, and authorize native inbound subscriptions. |
 | `email_generic.write` | Send email through the configured SMTP identity. |
 
 ## Operation Inventory
@@ -171,7 +182,7 @@ The current implementation does not include:
 - OAuth, XOAUTH2, SASL mechanism negotiation, app-password provisioning, password vault integration, or secret rotation
 - full MIME rendering, arbitrary attachment fetch, attachment send, inline image handling, DKIM signing, S/MIME, PGP, or spam/phishing analysis
 - public message fetch by UID, full mailbox synchronization, flag mutation, folder creation, folder deletion, move/copy/delete, draft handling, or delivery status tracking
-- webhook delivery, replay buffers, acknowledgements, durable UID state, or cross-process monitor recovery
+- webhook delivery, connector-owned replay buffers, durable UID state, or cross-process monitor recovery
 - address book lookup, contact dedupe, calendar invite parsing, unsubscribe handling, or auto-reply generation
 
 These are excluded on purpose:
@@ -202,7 +213,7 @@ The deterministic evidence currently covers:
 - operation inventory, manifest/introspection shape, capability assignment, handshake grants, doctor/health/self-check/shutdown behavior, and invoke health behavior
 - error mapping for configuration, IMAP, SMTP, IO, TLS, and address errors
 
-The remaining design gap is durable UID/replay ownership; the connector now has local loopback fixture tests plus a checked-in shell verification bundle for the supervised poll/fan-out boundary.
+The remaining design gap is durable UID/replay ownership. Regression coverage includes real SDK ACK waits, wrong ACK rejection, closed-tail replay, stale-generation rejection, token expiration during delivery, and a native subprocess communicating over stdin/stdout with a real loopback IMAP fixture. These tests are separate from any live provider qualification.
 
 ## Source Notes
 

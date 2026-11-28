@@ -40,6 +40,223 @@ const CAP_WRITE: &str = "email_generic.write";
 const LOOPBACK_ACCOUNT: &str = "local-user@example.com";
 const LOOPBACK_AUTH_VALUE: &str = "loopback-auth-marker";
 
+struct NativeEmailProcess(std::process::Child);
+
+impl Drop for NativeEmailProcess {
+    fn drop(&mut self) {
+        if self.0.try_wait().ok().flatten().is_none() {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+}
+
+#[test]
+fn native_stdio_delivers_imap_events_and_waits_for_exact_host_ack() {
+    let imap = ImapFixture::start(2);
+    let mut child = NativeEmailProcess(
+        std::process::Command::new(env!("CARGO_BIN_EXE_fcp-email-generic"))
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("start native email binary"),
+    );
+    let mut input = child.0.stdin.take().unwrap();
+    let output = child.0.stdout.take().unwrap();
+    let (frames_tx, frames_rx) = std::sync::mpsc::channel();
+    let reader = thread::spawn(move || {
+        for line in BufReader::new(output).lines() {
+            let Ok(line) = line else {
+                break;
+            };
+            let frame: Value = serde_json::from_str(&line).expect("stdout is framed JSON only");
+            if frames_tx.send(frame).is_err() {
+                break;
+            }
+        }
+    });
+    let send = |input: &mut std::process::ChildStdin, request: Value| {
+        writeln!(input, "{request}").unwrap();
+        input.flush().unwrap();
+    };
+    let receive = || {
+        frames_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("bounded native reply/event wait")
+    };
+    let key = Ed25519SigningKey::generate();
+    let instance = InstanceId::new();
+    let mut config = config_json(imap.port(), 2525);
+    config["monitor_policy"]["poll_interval_secs"] = json!(60);
+    send(
+        &mut input,
+        json!({"jsonrpc":"2.0", "id":"config", "method":"configure", "params":config}),
+    );
+    assert_eq!(receive()["result"]["status"], "configured");
+    let mut handshake = handshake_request(key.verifying_key().to_bytes());
+    handshake.requested_instance_id = Some(instance.clone());
+    send(
+        &mut input,
+        json!({"id":"handshake", "method":"handshake", "params":handshake}),
+    );
+    assert_eq!(receive()["result"]["event_caps"]["requires_ack"], true);
+    let token = capability_grant(&key, &instance, CAP_READ, "email_generic.subscribe");
+    send(
+        &mut input,
+        json!({"id":"subscription", "method":"subscribe", "params":{
+            "type":"subscribe", "id":"native-subscription", "stream_id":"email_native_test",
+            "topics":["email.inbound.preview"], "window_size":1, "capability_token":token,
+        }}),
+    );
+    let mut notification = None;
+    let mut subscribed = false;
+    for _ in 0..2 {
+        let frame = receive();
+        if frame["method"] == "event" {
+            notification = Some(frame);
+        } else {
+            assert_eq!(frame["id"], "subscription");
+            assert_eq!(
+                frame["result"]["result"]["confirmed_topics"],
+                json!(["email.inbound.preview"])
+            );
+            subscribed = true;
+        }
+    }
+    assert!(subscribed);
+    let frame = notification.expect("native notification arrived without another RPC");
+    let event = &frame["params"]["event"];
+    assert_eq!(event["requires_ack"], true);
+    assert_eq!(
+        event["data"]["instance_id"],
+        serde_json::to_value(&instance).unwrap()
+    );
+    assert_eq!(event["data"]["payload"]["uid"], "11");
+    assert_eq!(event["data"]["payload"]["uid_validity"], 42);
+    assert!(!frame.to_string().contains(LOOPBACK_AUTH_VALUE));
+    send(
+        &mut input,
+        json!({"id":"renewal", "method":"subscribe", "params":{
+            "type":"subscribe", "id":"native-renewal", "stream_id":"email_native_test",
+            "topics":["email.inbound.preview"], "window_size":1, "capability_token":token,
+        }}),
+    );
+    assert_eq!(
+        receive()["id"],
+        "renewal",
+        "renewal preserves the pending delivery"
+    );
+    send(
+        &mut input,
+        json!({"id":"before_ack", "method":"health", "params":{}}),
+    );
+    let before = receive();
+    assert_eq!(before["id"], "before_ack");
+    assert_eq!(
+        before["result"]["details"]["inbound_monitor"]["emitted_events"],
+        0
+    );
+
+    send(
+        &mut input,
+        json!({"method":"ack", "params":{
+            "stream_id":"email_native_test", "ack":{"type":"ack", "topic":"email.inbound.preview", "seqs":[event["seq"]], "cursors":["wrong"]}
+        }}),
+    );
+    send(
+        &mut input,
+        json!({"id":"wrong_ack", "method":"health", "params":{}}),
+    );
+    let rejected = receive();
+    assert_eq!(rejected["id"], "wrong_ack");
+    assert_eq!(
+        rejected["result"]["details"]["inbound_monitor"]["emitted_events"], 0,
+        "mismatched cursor must not acknowledge the event"
+    );
+    send(
+        &mut input,
+        json!({"method":"stream_close", "params":{"stream_id":"email_native_test"}}),
+    );
+    send(
+        &mut input,
+        json!({"id":"replacement", "method":"subscribe", "params":{
+            "type":"subscribe", "id":"native-replacement", "stream_id":"email_native_test",
+            "topics":["email.inbound.preview"], "window_size":1, "capability_token":token,
+        }}),
+    );
+    let mut replay = None;
+    for _ in 0..2 {
+        let next = receive();
+        if next["method"] == "event" {
+            replay = Some(next);
+        } else {
+            assert_eq!(next["id"], "replacement");
+            assert!(next.get("result").is_some());
+        }
+    }
+    let replay = replay.expect("unacknowledged UID replays after the old monitor settles");
+    assert_eq!(replay["params"]["event"]["cursor"], event["cursor"]);
+    assert_eq!(replay["params"]["event"]["seq"], event["seq"]);
+    assert_eq!(replay["params"]["event"]["data"], event["data"]);
+    send(
+        &mut input,
+        json!({"method":"ack", "params":{
+            "stream_id":"email_native_test", "ack":{"type":"ack", "topic":"email.inbound.preview", "seqs":[event["seq"]], "cursors":[event["cursor"]]}
+        }}),
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        send(
+            &mut input,
+            json!({"id":"after_ack", "method":"health", "params":{}}),
+        );
+        let health = receive();
+        assert_eq!(health["id"], "after_ack");
+        if health["result"]["details"]["inbound_monitor"]["emitted_events"] == 1 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "ACK must complete the batch"
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+    send(
+        &mut input,
+        json!({"id":"shutdown", "method":"shutdown", "params":shutdown_request("native test completed")}),
+    );
+    assert_eq!(receive()["result"]["status"], "shutdown_accepted");
+    // Keep stdin open: successful shutdown itself must terminate the process.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(status) = child.0.try_wait().unwrap() {
+            assert!(status.success());
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "native process must exit after shutdown"
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+    drop(input);
+    reader.join().unwrap();
+    let commands = imap.join();
+    assert!(
+        commands
+            .iter()
+            .any(|command| command.contains("(UID BODY.PEEK[])"))
+    );
+    assert_eq!(
+        commands
+            .iter()
+            .filter(|command| command.contains("UID SEARCH UNSEEN"))
+            .count(),
+        2
+    );
+}
+
 #[fcp_async_core::runtime::test]
 async fn local_non_mock_invokes_imap_read_and_smtp_write_paths() {
     let imap = ImapFixture::start(3);
